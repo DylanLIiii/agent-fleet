@@ -11,15 +11,30 @@ import sys
 import tempfile
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Event
 
 from agent_fleet.git import CloneError, clone_repo
-from agent_fleet.model import FleetError, Instance, runner_id
-from agent_fleet.providers import binary, gpu_count, readiness, run, systemd_available
+from agent_fleet.model import (
+    FleetError,
+    Instance,
+    local_dirs,
+    local_patterns,
+    runner_id,
+    under_root,
+)
+from agent_fleet.providers import (
+    amp_dirs_command,
+    amp_served_dirs,
+    binary,
+    gpu_count,
+    readiness,
+    run,
+    systemd_available,
+)
 from agent_fleet.store import Store, private_read, private_write, safe_path
 
 
@@ -34,6 +49,10 @@ def make_instance(
     backend: str = "auto",
     outpost: str = "",
     gpu_split: bool = False,
+    extra_dirs: Sequence[str] = (),
+    discover_dirs: Sequence[str] = (),
+    discover_depth: int = 0,
+    discover_excludes: Sequence[str] = (),
     preview: bool = False,
 ) -> Instance:
     if backend not in ("auto", "process", "systemd"):
@@ -62,6 +81,8 @@ def make_instance(
         # SCP-style remotes can omit the owner segment: host:repository.git.
         repo_name = repo_name.rsplit(":", 1)[-1]
     systemd = backend == "systemd" or (backend == "auto" and not preview and systemd_available())
+    if type(discover_depth) is not int or not 0 <= discover_depth <= 10:
+        raise FleetError("Discovery depth must be between 1 and 10, or left empty.")
     config = Instance(
         name,
         provider,
@@ -74,6 +95,10 @@ def make_instance(
         outpost_name=outpost,
         gpu_split=gpu_split,
         use_systemd=systemd,
+        extra_dirs=local_dirs("Extra directories", extra_dirs),
+        discover_dirs=local_dirs("Discovery roots", discover_dirs),
+        discover_depth=discover_depth,
+        discover_excludes=local_patterns("Discovery excludes", discover_excludes),
     )
     config.validate()
     return config
@@ -98,6 +123,16 @@ class WorkerStatus:
     state: str
     directory: Path
     backend: str
+
+
+@dataclass(frozen=True)
+class DirStatus:
+    """One directory an Amp runner serves, with live evidence when it is running."""
+
+    instance: str
+    path: str
+    kind: str  # checkout | extra | discover | discovered | runtime
+    live: bool | None
 
 
 class Manager:
@@ -374,6 +409,174 @@ class Manager:
                 self.store.save(updated)
             return actions + [f"Added {count} worker(s). Start them when you are ready."]
 
+    def _amp_config(self, name: str | None) -> Instance:
+        config = self.store.select(name)
+        if config.provider != "amp":
+            raise FleetError("Only Amp instances manage extra directories.")
+        self._require_managed_targets(config)
+        return config
+
+    def list_dirs(self, name: str | None) -> list[DirStatus]:
+        config = self._amp_config(name)
+        home = self.store.location(config.name)
+        live = amp_served_dirs(config)
+        served = set(live) if live is not None else None
+
+        def evidence(path: str, kind: str) -> bool | None:
+            if served is None:
+                return None
+            # A discovery root is served through the checkouts Amp finds beneath it.
+            return (
+                any(under_root(item, path) for item in served)
+                if kind == "discover"
+                else path in served
+            )
+
+        rows = []
+        for index in config.active_workers:
+            path = str(config.worker_dir(home, index))
+            rows.append(DirStatus(config.name, path, "checkout", evidence(path, "checkout")))
+        for path in config.extra_dirs:
+            rows.append(DirStatus(config.name, path, "extra", evidence(path, "extra")))
+        for path in config.discover_dirs:
+            rows.append(DirStatus(config.name, path, "discover", evidence(path, "discover")))
+        if served is not None:
+            known = {row.path for row in rows}
+            for path in sorted(served):
+                if path in known:
+                    continue
+                kind = (
+                    "discovered"
+                    if any(under_root(path, root) for root in config.discover_dirs)
+                    else "runtime"
+                )
+                rows.append(DirStatus(config.name, path, kind, True))
+        return rows
+
+    def add_dirs(self, name: str | None, paths: list[str]) -> list[str]:
+        with self.store.lock(self.dry_run):
+            config = self._amp_config(name)
+            added = local_dirs("Extra directories", paths)
+            if not added:
+                raise FleetError("Enter at least one directory.")
+            new = tuple(path for path in added if path not in config.extra_dirs)
+            if not new:
+                raise FleetError("Those directories are already configured.")
+            updated = replace(config, extra_dirs=config.extra_dirs + new)
+            updated.validate()
+            if self.dry_run:
+                return [f"Would serve {path}." for path in new]
+            live = self.running(config, config.active_workers[0])
+            # Apply to the running runner first: a rejected directory stays unconfigured.
+            if live:
+                run(amp_dirs_command(config, "add", list(new)))
+            self.store.save(updated)
+            return [
+                f"{path}: "
+                + ("served by the running runner." if live else "served when the runner starts.")
+                for path in new
+            ]
+
+    def remove_dirs(self, name: str | None, paths: list[str]) -> list[str]:
+        with self.store.lock(self.dry_run):
+            config = self._amp_config(name)
+            wanted = []
+            for value in paths:
+                text = str(value).strip()
+                if not text or any(ord(c) < 32 for c in text):
+                    raise FleetError("Directories cannot contain control characters.")
+                resolved = str(Path(text).expanduser().resolve())
+                if resolved not in wanted:
+                    wanted.append(resolved)
+            if not wanted:
+                raise FleetError("Enter at least one directory.")
+            unknown = [
+                path
+                for path in wanted
+                if path not in config.extra_dirs and path not in config.discover_dirs
+            ]
+            if unknown:
+                raise FleetError(f"Not a configured directory: {unknown[0]}")
+            extras = [path for path in wanted if path in config.extra_dirs]
+            roots = [path for path in wanted if path in config.discover_dirs]
+            remaining = tuple(path for path in config.discover_dirs if path not in roots)
+            updated = replace(
+                config,
+                extra_dirs=tuple(path for path in config.extra_dirs if path not in extras),
+                discover_dirs=remaining,
+                discover_depth=0 if not remaining else config.discover_depth,
+                discover_excludes=() if not remaining else config.discover_excludes,
+            )
+            updated.validate()
+            if self.dry_run:
+                return [f"Would stop serving {path}." for path in wanted]
+            result = []
+            live = self.running(config, config.active_workers[0])
+            if extras and live:
+                try:
+                    run(amp_dirs_command(config, "remove", extras))
+                except FleetError:
+                    result.append(
+                        "The running runner still serves them; restart it to stop "
+                        "(discovery may cover them)."
+                    )
+            self.store.save(updated)
+            for path in extras:
+                result.append(f"{path}: removed from configuration.")
+            for path in roots:
+                result.append(f"{path}: discovery root removed; applies at the next start.")
+            return result
+
+    def edit_discovery(
+        self,
+        name: str | None,
+        *,
+        add: Sequence[str] = (),
+        depth: int | None = None,
+        add_excludes: Sequence[str] = (),
+        clear: bool = False,
+    ) -> list[str]:
+        """Set Amp directory discovery. ``depth=None`` keeps the configured depth."""
+        with self.store.lock(self.dry_run):
+            config = self._amp_config(name)
+            if clear:
+                found, patterns, levels = (), (), 0
+            else:
+                if depth is not None and (type(depth) is not int or not 1 <= depth <= 10):
+                    raise FleetError("Discovery depth must be between 1 and 10, or left empty.")
+                # Existing entries stay as configured: a root may be temporarily absent.
+                added = local_dirs("Discovery roots", [str(path) for path in add])
+                found = tuple(dict.fromkeys([*config.discover_dirs, *added]))
+                extra_patterns = local_patterns(
+                    "Discovery excludes", [str(pattern) for pattern in add_excludes]
+                )
+                patterns = tuple(dict.fromkeys([*config.discover_excludes, *extra_patterns]))
+                levels = config.discover_depth if depth is None else depth
+            updated = replace(
+                config,
+                discover_dirs=found,
+                discover_depth=levels,
+                discover_excludes=patterns,
+            )
+            updated.validate()
+            if self.dry_run:
+                return [f"Would discover Git checkouts under {path}." for path in found] or [
+                    "Would turn Amp directory discovery off."
+                ]
+            self.store.save(updated)
+            result = [f"Discover Git checkouts under {path}." for path in found]
+            if not found:
+                result.append("Amp directory discovery is off.")
+            result.append(
+                "Discovery applies when the runner starts."
+                + (
+                    " Restart it to apply this now."
+                    if self.running(config, config.active_workers[0])
+                    else ""
+                )
+            )
+            return result
+
     def _unit_owned(self, config: Instance, index: int) -> Path:
         unit = self.paths(config, index)[2]
         safe_path(unit)
@@ -399,6 +602,29 @@ class Manager:
             "--worker",
             str(index),
         ]
+
+    def _sync_amp_dirs(self, config: Instance) -> None:
+        """Converge a started runner's directory set onto the instance configuration."""
+        home = self.store.location(config.name)
+        live = amp_served_dirs(config)
+        if live is None:
+            raise FleetError("Amp did not report the directories its runner serves.")
+        missing = [path for path in config.extra_dirs if path not in live]
+        if missing:
+            run(amp_dirs_command(config, "add", missing))
+        roots = set(config.discover_dirs)
+        keep = {str(config.worker_dir(home, index)) for index in config.active_workers} | set(
+            config.extra_dirs
+        )
+        for path in live:
+            if path in keep or path in roots or any(under_root(path, root) for root in roots):
+                continue
+            try:
+                run(amp_dirs_command(config, "remove", [path]))
+            except FleetError:
+                # Amp refuses to unserve directories from its own flags or discovery; the
+                # loop only meets those when discovery reached outside its roots.
+                continue
 
     def _start(self, config: Instance, index: int) -> str:
         home = self.store.location(config.name)
@@ -481,6 +707,8 @@ class Manager:
                         time.sleep(min(2, self.ready_timeout))
                         if not self.running(config, index):
                             raise FleetError("Worker exited during startup. Check its logs.")
+                    if config.provider == "amp":
+                        self._sync_amp_dirs(config)
                     return (
                         f"{config.key(index)}: {evidence}. "
                         "Remote dispatch must be confirmed on-platform."

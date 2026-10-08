@@ -3,7 +3,7 @@ from textual.command import CommandPalette
 from textual.widgets import Button, Checkbox, DataTable, Input, Select, Static, TabbedContent
 
 from agent_fleet.manager import Manager
-from agent_fleet.ui import ConfirmScreen, FleetApp, HelpScreen, SetupScreen
+from agent_fleet.ui import ConfirmScreen, DirsScreen, FleetApp, HelpScreen, SetupScreen
 
 
 @pytest.mark.parametrize("size", [(120, 40), (90, 28), (70, 22)])
@@ -153,3 +153,56 @@ async def test_legacy_worker_actions_are_read_only_in_dashboard(legacy_cursor):
         assert process.poll() is None
         assert record.read_bytes() == before
         assert "read-only" in str(app.query_one("#context", Static).render())
+
+
+async def test_setup_amp_directory_fields(store):
+    app = FleetApp(Manager(store))
+    async with app.run_test(size=(110, 42)) as pilot:
+        await pilot.pause()
+        await pilot.press("n")
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, SetupScreen)
+        assert not screen.query_one("#dirs-fields").display
+        screen.query_one("#provider", Select).value = "amp"
+        await pilot.pause()
+        assert screen.query_one("#dirs-fields").display
+        screen.query_one("#provider", Select).value = "droid"
+        await pilot.pause()
+        assert not screen.query_one("#dirs-fields").display
+        await pilot.press("escape")
+
+
+async def test_dirs_dialog_serves_directories(manager, config, tmp_path):
+    manager.setup(config)
+    extra = tmp_path / "worktree"
+    extra.mkdir()
+    root = tmp_path / "code"
+    root.mkdir()
+    app = FleetApp(manager)
+    async with app.run_test(size=(110, 36)) as pilot:
+        await pilot.pause()
+        await pilot.press("e")
+        await pilot.pause(0.5)
+        assert isinstance(app.screen, DirsScreen)
+        screen = app.screen
+        assert screen.query_one("#dir-list", DataTable).row_count == 2
+        screen.query_one("#dir-path", Input).value = str(extra)
+        assert await pilot.click("#dir-add")
+        await pilot.pause(0.5)
+        assert manager.store.load(config.name).extra_dirs == (str(extra.resolve()),)
+        assert len(app.screen_stack) == 1
+        await pilot.press("e")
+        await pilot.pause(0.5)
+        app.screen.query_one("#dir-path", Input).value = str(root)
+        assert await pilot.click("#dir-discover")
+        await pilot.pause(0.5)
+        assert manager.store.load(config.name).discover_dirs == (str(root.resolve()),)
+        await pilot.press("e")
+        await pilot.pause(0.5)
+        # Rows: two checkouts, then the extra directory, then the discovery root.
+        app.screen.query_one("#dir-list", DataTable).move_cursor(row=2)
+        assert await pilot.click("#dir-remove")
+        await pilot.pause(0.5)
+        assert manager.store.load(config.name).extra_dirs == ()
+        assert manager.store.load(config.name).discover_dirs == (str(root.resolve()),)

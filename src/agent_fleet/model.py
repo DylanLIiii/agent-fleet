@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import re
 import socket
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -24,6 +25,65 @@ def valid_name(value: str) -> str:
     return value
 
 
+def _clean(value: str) -> bool:
+    return bool(value) and not any(ord(c) < 32 for c in value) and value.strip() == value
+
+
+def check_paths(label: str, values: tuple[str, ...]) -> None:
+    if not isinstance(values, tuple) or any(not isinstance(v, str) for v in values):
+        raise FleetError(f"{label} must be a list of paths.")
+    for value in values:
+        if not _clean(value):
+            raise FleetError(f"{label} cannot contain control characters.")
+        if not Path(value).is_absolute():
+            raise FleetError(f"{label} must use absolute paths.")
+    if len(set(values)) != len(values):
+        raise FleetError(f"{label} must not repeat a path.")
+
+
+def check_patterns(label: str, values: tuple[str, ...]) -> None:
+    if not isinstance(values, tuple) or any(not isinstance(v, str) for v in values):
+        raise FleetError(f"{label} must be a list of patterns.")
+    for value in values:
+        if not _clean(value):
+            raise FleetError(f"{label} cannot contain control characters.")
+    if len(set(values)) != len(values):
+        raise FleetError(f"{label} must not repeat a pattern.")
+
+
+def local_dirs(label: str, values: Sequence[str]) -> tuple[str, ...]:
+    """Normalize user-supplied directories to unique existing absolute paths."""
+    result: list[str] = []
+    for value in values:
+        text = str(value).strip()
+        if not _clean(text):
+            raise FleetError(f"{label} cannot contain control characters.")
+        path = Path(text).expanduser()
+        if not path.is_absolute():
+            raise FleetError(f"{label} must use absolute paths.")
+        if not path.is_dir():
+            raise FleetError(f"{label} is not an existing directory: {path}")
+        resolved = str(path.resolve())
+        if resolved not in result:
+            result.append(resolved)
+    return tuple(result)
+
+
+def local_patterns(label: str, values: Sequence[str]) -> tuple[str, ...]:
+    result: list[str] = []
+    for value in values:
+        text = str(value).strip()
+        if not _clean(text):
+            raise FleetError(f"{label} cannot contain control characters.")
+        if text and text not in result:
+            result.append(text)
+    return tuple(result)
+
+
+def under_root(path: str, root: str) -> bool:
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
 def runner_id(home: Path, provider: str, label: str = "") -> str:
     label = label or f"{socket.gethostname().split('.')[0]}-{provider}"
     label = re.sub(r"[^A-Za-z0-9-]", "-", label).strip("-") or "agent-fleet"
@@ -43,6 +103,11 @@ class Instance:
     outpost_name: str = ""
     gpu_split: bool = False
     use_systemd: bool = False
+    # Amp only: directories served besides the managed checkouts, and Amp-side discovery.
+    extra_dirs: tuple[str, ...] = ()
+    discover_dirs: tuple[str, ...] = ()
+    discover_depth: int = 0
+    discover_excludes: tuple[str, ...] = ()
 
     def validate(self) -> None:
         if self.name != "legacy":
@@ -66,6 +131,16 @@ class Instance:
         for value in (self.repo_url, self.droid_dir, self.outpost_name):
             if not isinstance(value, str) or any(ord(c) < 32 for c in value):
                 raise FleetError("Configuration fields cannot contain control characters.")
+        if self.provider == "amp":
+            check_paths("Extra directories", self.extra_dirs)
+            check_paths("Discovery roots", self.discover_dirs)
+            check_patterns("Discovery excludes", self.discover_excludes)
+            if type(self.discover_depth) is not int or not 0 <= self.discover_depth <= 10:
+                raise FleetError("Discovery depth must be between 1 and 10, or left empty.")
+            if (self.discover_depth or self.discover_excludes) and not self.discover_dirs:
+                raise FleetError("Discovery depth and excludes need at least one discovery root.")
+        elif self.extra_dirs or self.discover_dirs or self.discover_depth or self.discover_excludes:
+            raise FleetError("Only Amp instances can serve extra directories.")
         if self.provider == "droid":
             if self.worker_count != 1 or not Path(self.droid_dir).is_absolute():
                 raise FleetError("Droid requires one worker and an absolute local directory.")

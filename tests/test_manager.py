@@ -333,3 +333,150 @@ def test_legacy_record_with_wrong_process_birth_is_unverified(legacy_cursor):
     manager, config, record, process = legacy_cursor
     record.write_text(f"{process.pid} 1\n")
     assert manager.status(config.name, probe=False)[0].state == "unverified PID"
+
+
+def test_amp_startup_flags_cover_discovery_only(config, tmp_path):
+    extra = tmp_path / "extra"
+    extra.mkdir()
+    root = tmp_path / "code"
+    root.mkdir()
+    amp = replace(
+        config,
+        extra_dirs=(str(extra),),
+        discover_dirs=(str(root),),
+        discover_depth=3,
+        discover_excludes=("dotfiles",),
+    )
+    command = build_command(amp, tmp_path, 1, executable="/bin/amp")
+    # Extra directories change while the runner runs, so they are not startup flags.
+    assert str(extra) not in command.argv
+    assert f"--discover-dirs={root}" in command.argv
+    assert command.argv[command.argv.index("--discover-depth") + 1] == "3"
+    assert command.argv[command.argv.index("--discover-exclude") + 1] == "dotfiles"
+    assert "--no-serve-cwd" in command.argv
+
+
+def test_make_instance_rejects_bad_directory_configuration(store, source, tmp_path):
+    with pytest.raises(FleetError, match="Only Amp"):
+        make_instance(
+            store,
+            name="cursor-dirs",
+            provider="cursor",
+            source=str(source),
+            extra_dirs=[str(tmp_path)],
+            preview=True,
+        )
+    with pytest.raises(FleetError, match="absolute"):
+        make_instance(
+            store,
+            name="amp-relative",
+            provider="amp",
+            source=str(source),
+            extra_dirs=["worktrees/one"],
+            preview=True,
+        )
+    with pytest.raises(FleetError, match="not an existing directory"):
+        make_instance(
+            store,
+            name="amp-missing",
+            provider="amp",
+            source=str(source),
+            extra_dirs=[str(tmp_path / "missing")],
+            preview=True,
+        )
+    with pytest.raises(FleetError, match="Discovery depth"):
+        make_instance(
+            store,
+            name="amp-depth",
+            provider="amp",
+            source=str(source),
+            discover_dirs=[str(tmp_path)],
+            discover_depth=11,
+            preview=True,
+        )
+    with pytest.raises(FleetError, match="discovery root"):
+        make_instance(
+            store,
+            name="amp-exclude",
+            provider="amp",
+            source=str(source),
+            discover_excludes=["dotfiles"],
+            preview=True,
+        )
+
+
+def test_amp_extra_directories_apply_live_and_remove(
+    manager, config, fake_amp, tmp_path, amp_calls
+):
+    extra = str((tmp_path / "worktree").resolve())
+    (tmp_path / "worktree").mkdir()
+    manager.setup(config)
+    manager.control("start", config.name)
+    try:
+        messages = manager.add_dirs(config.name, [extra])
+        assert any("running runner" in message for message in messages)
+        rows = {row.path: row for row in manager.list_dirs(config.name)}
+        assert rows[extra].kind == "extra" and rows[extra].live is True
+        assert f"add {extra}" in amp_calls.read_text()
+        assert manager.remove_dirs(config.name, [extra])
+        rows = {row.path: row for row in manager.list_dirs(config.name)}
+        assert extra not in rows
+        assert manager.store.load(config.name).extra_dirs == ()
+    finally:
+        manager.control("stop", config.name)
+
+
+def test_amp_start_converges_served_directories(
+    manager, config, fake_amp, tmp_path, amp_calls, amp_state
+):
+    kept = tmp_path / "kept"
+    kept.mkdir()
+    stale = tmp_path / "stale"
+    stale.mkdir()
+    configured = replace(config, extra_dirs=(str(kept.resolve()),))
+    manager.setup(configured)
+    amp_state.write_text(f"{stale}\n")
+    manager.control("start", configured.name)
+    try:
+        rows = {row.path: row for row in manager.list_dirs(configured.name)}
+        assert rows[str(kept.resolve())].live is True
+        assert str(stale) not in rows
+    finally:
+        manager.control("stop", configured.name)
+    calls = amp_calls.read_text()
+    assert f"add {kept.resolve()}" in calls
+    assert f"remove {stale}" in calls
+
+
+def test_amp_discovery_configuration(manager, config, tmp_path):
+    root = tmp_path / "code"
+    root.mkdir()
+    manager.setup(config)
+    messages = manager.edit_discovery(
+        config.name, add=[str(root)], depth=3, add_excludes=["dotfiles"]
+    )
+    assert any("starts" in message for message in messages)
+    saved = manager.store.load(config.name)
+    assert saved.discover_dirs == (str(root.resolve()),)
+    assert saved.discover_depth == 3
+    assert saved.discover_excludes == ("dotfiles",)
+    with pytest.raises(FleetError, match="Discovery depth"):
+        manager.edit_discovery(config.name, depth=11)
+    manager.edit_discovery(config.name, clear=True)
+    cleared = manager.store.load(config.name)
+    assert (cleared.discover_dirs, cleared.discover_depth, cleared.discover_excludes) == ((), 0, ())
+
+
+def test_directory_management_is_amp_only(manager, config, source, tmp_path):
+    cursor = replace(config, provider="cursor", name="cursor-lab")
+    manager.setup(cursor)
+    with pytest.raises(FleetError, match="Only Amp"):
+        manager.add_dirs("cursor-lab", [str(tmp_path)])
+    with pytest.raises(FleetError, match="Only Amp"):
+        manager.list_dirs("cursor-lab")
+
+
+def test_removing_unconfigured_directory_is_refused(manager, config, tmp_path):
+    manager.setup(config)
+    with pytest.raises(FleetError, match="Not a configured directory"):
+        manager.remove_dirs(config.name, [str(tmp_path)])

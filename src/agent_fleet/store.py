@@ -68,6 +68,10 @@ def parse_legacy(text: str) -> dict[str, str]:
         "GPU_SPLIT",
         "OUTPOST_NAME",
         "USE_SYSTEMD",
+        "EXTRA_DIRS",
+        "DISCOVER_DIRS",
+        "DISCOVER_DEPTH",
+        "DISCOVER_EXCLUDES",
     }
     for line in text.splitlines():
         if not line.strip() or line.lstrip().startswith("#"):
@@ -87,6 +91,20 @@ def parse_legacy(text: str) -> dict[str, str]:
             raise FleetError(f"Duplicate legacy field: {key}")
         values[key] = parts[0] if parts else ""
     return values
+
+
+def legacy_list(values: dict[str, str], key: str) -> tuple[str, ...]:
+    """Read a JSON-encoded legacy list, written as one quoted shell word."""
+    text = values.get(key, "")
+    if not text:
+        return ()
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        raise FleetError(f"Invalid legacy setting: {key}") from exc
+    if not isinstance(data, list) or any(not isinstance(item, str) for item in data):
+        raise FleetError(f"Invalid legacy setting: {key}")
+    return tuple(data)
 
 
 class Store:
@@ -163,7 +181,9 @@ class Store:
         try:
             if native.exists() or native.is_symlink():
                 data = json.loads(private_read(native))
-                data["active_workers"] = tuple(data["active_workers"])
+                for key in ("active_workers", "extra_dirs", "discover_dirs", "discover_excludes"):
+                    if key in data:
+                        data[key] = tuple(data[key])
                 config = Instance(**data)
                 if config.name != name:
                     raise FleetError("Config name does not match its instance directory.")
@@ -196,6 +216,10 @@ class Store:
                     outpost_name=data.get("OUTPOST_NAME", ""),
                     gpu_split=data["GPU_SPLIT"] == "yes",
                     use_systemd=data["USE_SYSTEMD"] == "yes",
+                    extra_dirs=legacy_list(data, "EXTRA_DIRS"),
+                    discover_dirs=legacy_list(data, "DISCOVER_DIRS"),
+                    discover_depth=int(data.get("DISCOVER_DEPTH") or 0),
+                    discover_excludes=legacy_list(data, "DISCOVER_EXCLUDES"),
                 )
             else:
                 raise FleetError(f"Instance '{name}' is not configured.")
@@ -236,6 +260,11 @@ class Store:
                 "GPU_SPLIT": "yes" if config.gpu_split else "no",
                 "OUTPOST_NAME": config.outpost_name,
                 "USE_SYSTEMD": "yes" if config.use_systemd else "no",
+                # Directory lists stay one quoted word: a JSON array survives the legacy parser.
+                "EXTRA_DIRS": json.dumps(list(config.extra_dirs)),
+                "DISCOVER_DIRS": json.dumps(list(config.discover_dirs)),
+                "DISCOVER_DEPTH": str(config.discover_depth),
+                "DISCOVER_EXCLUDES": json.dumps(list(config.discover_excludes)),
             }
             private_write(
                 legacy, "\n".join(f"{k}={shlex.quote(v)}" for k, v in fields.items()) + "\n"

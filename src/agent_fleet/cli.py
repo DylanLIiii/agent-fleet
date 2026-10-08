@@ -92,6 +92,20 @@ def setup(
     backend: str = "auto",
     outpost: str = "",
     gpu_split: bool = False,
+    extra_dir: Annotated[
+        list[str], typer.Option("--extra-dir", help="Amp: also serve this directory.")
+    ] = (),
+    discover: Annotated[
+        list[str],
+        typer.Option("--discover", help="Amp: discover Git checkouts under this directory."),
+    ] = (),
+    discover_depth: Annotated[
+        int | None,
+        typer.Option("--discover-depth", min=1, max=10, help="Amp: discovery scan depth."),
+    ] = None,
+    discover_exclude: Annotated[
+        list[str], typer.Option("--discover-exclude", help="Amp: skip matching discovered paths.")
+    ] = (),
 ) -> None:
     """Create an instance. Omit flags for the interactive setup form."""
     manager, selected = ctx.obj
@@ -113,6 +127,10 @@ def setup(
         backend=backend,
         outpost=outpost,
         gpu_split=gpu_split,
+        extra_dirs=extra_dir,
+        discover_dirs=discover,
+        discover_depth=discover_depth or 0,
+        discover_excludes=discover_exclude,
         preview=manager.dry_run,
     )
     secret = ""
@@ -196,6 +214,70 @@ def add(ctx: typer.Context, count: Annotated[int, typer.Argument(min=1, max=128)
     """Add independent checkouts without overwriting existing workers."""
     manager, selected = ctx.obj
     output(manager.add(selected, count), preview=manager.dry_run)
+
+
+dirs_app = typer.Typer(
+    help="Manage the directories an Amp runner serves.",
+    no_args_is_help=False,
+)
+app.add_typer(dirs_app, name="dirs")
+
+
+@dirs_app.callback(invoke_without_command=True)
+def dirs_root(ctx: typer.Context) -> None:
+    """List served directories. Run without a subcommand to list them."""
+    manager, selected = ctx.obj
+    if ctx.invoked_subcommand is not None:
+        return
+    table = Table(title="Amp directories", border_style="blue")
+    for column in ("Kind", "Served", "Path"):
+        table.add_column(column)
+    for row in manager.list_dirs(selected):
+        served = "unknown" if row.live is None else ("yes" if row.live else "not yet")
+        table.add_row(row.kind, served, Text(row.path))
+    console.print(table)
+
+
+@dirs_app.command("add")
+def dirs_add(
+    ctx: typer.Context,
+    paths: Annotated[list[str], typer.Argument(help="Absolute directories to serve.")],
+) -> None:
+    """Serve extra directories, on a running runner immediately."""
+    manager, selected = ctx.obj
+    output(manager.add_dirs(selected, paths), preview=manager.dry_run)
+
+
+@dirs_app.command("remove")
+def dirs_remove(
+    ctx: typer.Context,
+    paths: Annotated[list[str], typer.Argument(help="Configured directories to stop serving.")],
+) -> None:
+    """Stop serving extra directories or discovery roots."""
+    manager, selected = ctx.obj
+    output(manager.remove_dirs(selected, paths), preview=manager.dry_run)
+
+
+@dirs_app.command("discover")
+def dirs_discover(
+    ctx: typer.Context,
+    roots: Annotated[list[str], typer.Argument(help="Directories to scan for Git checkouts.")] = (),
+    depth: Annotated[int | None, typer.Option("--depth", min=1, max=10, help="Scan depth.")] = None,
+    exclude: Annotated[list[str], typer.Option("--exclude", help="Skip matching paths.")] = (),
+    clear: Annotated[bool, typer.Option("--clear", help="Turn directory discovery off.")] = False,
+) -> None:
+    """Add discovery roots, scan depth and excludes. --clear turns discovery off."""
+    manager, selected = ctx.obj
+    output(
+        manager.edit_discovery(
+            selected,
+            add=roots,
+            depth=depth,
+            add_excludes=exclude,
+            clear=clear,
+        ),
+        preview=manager.dry_run,
+    )
 
 
 @app.command()

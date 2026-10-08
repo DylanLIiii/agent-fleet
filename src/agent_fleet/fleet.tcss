@@ -198,7 +198,7 @@ ModalScreen {
     align: center middle;
     background: #050a12 80%;
 }
-#setup-dialog, #confirm-dialog, #add-dialog, #remove-dialog, #help-dialog {
+#setup-dialog, #confirm-dialog, #add-dialog, #remove-dialog, #help-dialog, #dirs-dialog {
     width: 72;
     max-width: 95%;
     height: auto;
@@ -209,6 +209,9 @@ ModalScreen {
 }
 #setup-dialog, #help-dialog {
     height: 90%;
+}
+#dirs-dialog {
+    width: 84;
 }
 .dialog-title {
     text-style: bold;
@@ -239,6 +242,21 @@ Input:focus {
 }
 #capacity-row > Vertical {
     width: 1fr;
+}
+#dirs-fields, #discover-row {
+    height: auto;
+}
+#discover-row {
+    height: 5;
+}
+#discover-row > Vertical {
+    width: 1fr;
+}
+#dir-list {
+    height: 12;
+    margin-bottom: 1;
+    background: #0e1723;
+    border: round #263b54;
 }
 #credential-fields, #outpost-fields {
     height: auto;

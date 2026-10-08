@@ -51,7 +51,7 @@ Setup can prepare configuration and workspaces before a provider CLI is installe
 | --- | --- | --- |
 | Cursor | One worker per independent checkout, data directory and management port | Local `/readyz` |
 | Devin | One Outpost worker per workspace; repository under `repos/` | Process alive; remote readiness unverified |
-| Amp | **One runner** with repeated `--dir` for all active checkouts | Matching runner in `amp runner list --json` |
+| Amp | **One runner** serving its checkouts, your own directories and Amp-discovered checkouts | Matching runner in `amp runner list --json` |
 | Droid | **One Computer per Fleet home**, using a local directory or a managed Git clone | Local `daemon.loopback` diagnostic |
 
 Only one Droid registration is supported by the provider per machine. Do not create
@@ -67,6 +67,7 @@ tasks. Confirm dispatch on the provider platform.
 | `s` / `x` | Start / stop selected worker |
 | `ctrl+r` | Restart selected worker |
 | `a` | Add workers to selected instance |
+| `e` | Manage Amp directories |
 | `delete` | Remove selected worker |
 | `r` | Refresh |
 | `l` / `d` | Logs / health |
@@ -97,6 +98,21 @@ agent-fleet --instance cursor-lab --dry-run remove 1
 agent-fleet --instance cursor-lab remove 1
 ```
 
+Amp instances can serve directories that Fleet never clones — existing worktrees
+and local projects — and can let Amp discover checkouts on its own:
+
+```console
+agent-fleet setup --provider amp --name amp-lab \
+  --source git@github.com:you/project.git --count 2 \
+  --extra-dir /home/you/worktrees/topic \
+  --discover /home/you/code --discover-depth 3 --discover-exclude dotfiles
+agent-fleet --instance amp-lab dirs
+agent-fleet --instance amp-lab dirs add /home/you/worktrees/other
+agent-fleet --instance amp-lab dirs remove /home/you/worktrees/topic
+agent-fleet --instance amp-lab dirs discover /home/you/more --depth 2
+agent-fleet --instance amp-lab dirs discover --clear
+```
+
 Use `--backend process` or `--backend systemd` at setup to override auto-detection.
 For Devin, add `--outpost NAME`; the token is requested using a masked prompt.
 For Droid, use `--source /absolute/local/path` to reuse a directory, or a Git URL
@@ -122,6 +138,26 @@ independent Cursor/Devin/Amp clones. Existing source directories are never overw
 including an empty value for workers without an assigned GPU. Amp's single process
 cannot isolate GPUs per checkout; all its directories share one GPU environment.
 Stop all workers before scaling an instance with GPU allocation enabled.
+
+## Amp directories
+
+An Amp instance runs one runner that serves directories, not one process per
+directory. It always serves its managed checkouts, and it can serve more:
+
+- **Extra directories** (`--extra-dir`, `agent-fleet dirs add`, `e` in the
+  dashboard) are existing folders — worktrees, local projects, anything
+  absolute. Fleet never clones or deletes them. While the runner is up, adding
+  and removing them takes effect immediately through `amp runner dirs add` and
+  `amp runner dirs remove`.
+- **Discovery** (`--discover`, `agent-fleet dirs discover`) lets Amp serve every
+  Git checkout up to two levels beneath a root, including registered worktrees.
+  Depth (`--discover-depth`, 1–10) and exclusions (`--discover-exclude`, in
+  `.gitignore` style) tune the scan. Discovery is set when the runner starts.
+
+Fleet keeps the runner's directory list in sync with the instance configuration
+whenever it starts one, so directories added outside Fleet are dropped at the
+next start. Add them with `agent-fleet dirs add` to keep them. Worker checkouts
+still change only while the runner is stopped.
 
 ## State and safety
 

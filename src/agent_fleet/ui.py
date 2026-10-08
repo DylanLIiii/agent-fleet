@@ -30,7 +30,7 @@ from textual.widgets import (
     TabPane,
 )
 
-from agent_fleet.manager import Manager, WorkerStatus, make_instance
+from agent_fleet.manager import DirStatus, Manager, WorkerStatus, make_instance
 from agent_fleet.model import PROVIDERS, FleetError, Instance, valid_name
 from agent_fleet.providers import GUIDANCE
 
@@ -43,6 +43,8 @@ Use the command line with `all` to control every worker in an instance.
 
 **Amp and Droid share one process.** A row action controls the entire runner.
 Amp serves several directories; Droid uses one existing directory.
+Amp also serves directories you add yourself (`e`) and Git checkouts it
+discovers under the roots you choose.
 
 ## Keys
 
@@ -52,6 +54,7 @@ Amp serves several directories; Droid uses one existing directory.
 | `s` / `x` | Start / stop selected worker |
 | `ctrl+r` | Restart selected worker |
 | `a` | Add workers |
+| `e` | Manage Amp directories |
 | `delete` | Remove selected worker, with confirmation |
 | `r` | Refresh readiness |
 | `l` / `d` | Logs / diagnostics |
@@ -77,6 +80,10 @@ stored with permissions `600`, and omitted from configuration and service units.
 Removal keeps checkouts by default. Optional deletion requires verified ownership,
 a clean checkout (including ignored files), and no unpushed branch commits.
 """
+
+
+def split_values(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
 
 
 class FleetHeader(Header):
@@ -205,6 +212,86 @@ class RemoveScreen(ModalScreen[bool | None]):
         self.dismiss(None)
 
 
+class DirsScreen(ModalScreen[tuple[str, dict[str, Any]] | None]):
+    """Manage the directories an Amp runner serves, live when it runs."""
+
+    BINDINGS = [("escape", "cancel", "Close")]
+
+    def __init__(self, config: Instance):
+        super().__init__()
+        self.config = config
+        self.rows: list[DirStatus] = []
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dirs-dialog"):
+            yield Label(f"{self.config.name} · served directories", classes="dialog-title")
+            yield Static(
+                "Directories you serve join a running runner at once. Discovery roots apply "
+                "when it starts. Directories added outside Agent Fleet are dropped at the "
+                "next start.",
+                classes="muted",
+            )
+            yield DataTable(id="dir-list", cursor_type="row")
+            yield Input(placeholder="/absolute/path", id="dir-path")
+            with Horizontal(classes="dialog-actions"):
+                yield Button("Close", id="cancel")
+                yield Button("Remove selected", id="dir-remove")
+                yield Button("Discover here", id="dir-discover")
+                yield Button("Serve directory", id="dir-add", variant="primary")
+
+    def on_mount(self) -> None:
+        table = self.query_one("#dir-list", DataTable)
+        table.add_columns("Kind", "Served", "Path")
+        self.refresh_rows()
+        self.query_one("#dir-path", Input).focus()
+
+    @work(exclusive=True, group="dir-list")
+    async def refresh_rows(self) -> None:
+        try:
+            rows = await asyncio.to_thread(self.app.manager.list_dirs, self.config.name)
+        except (FleetError, OSError) as exc:
+            self.notify(str(exc), severity="error", timeout=8)
+            return
+        self.rows = rows
+        table = self.query_one("#dir-list", DataTable)
+        table.clear()
+        for row in rows:
+            served = "—" if row.live is None else ("yes" if row.live else "not yet")
+            table.add_row(row.kind, served, row.path)
+
+    @on(Button.Pressed)
+    def pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "cancel":
+            self.dismiss(None)
+            return
+        if event.button.id in ("dir-add", "dir-discover"):
+            path = self.query_one("#dir-path", Input).value.strip()
+            if not path:
+                self.notify("Enter an absolute directory first.", severity="warning")
+                return
+            self.dismiss(
+                ("add_dirs", {"paths": [path]})
+                if event.button.id == "dir-add"
+                else ("edit_discovery", {"add": [path]})
+            )
+            return
+        table = self.query_one("#dir-list", DataTable)
+        row = self.rows[table.cursor_row] if 0 <= table.cursor_row < len(self.rows) else None
+        if row is None:
+            self.notify("Select a directory first.", severity="warning")
+        elif row.kind == "discovered":
+            self.notify("Found by Amp discovery; remove its discovery root instead.")
+        elif row.kind == "runtime":
+            self.notify(
+                "Added outside Agent Fleet; it is dropped at the next start.", severity="warning"
+            )
+        else:
+            self.dismiss(("remove_dirs", {"paths": [row.path]}))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class SetupScreen(ModalScreen[tuple[dict[str, Any], str, bool] | None]):
     BINDINGS = [("escape", "cancel", "Cancel")]
 
@@ -249,6 +336,23 @@ class SetupScreen(ModalScreen[tuple[dict[str, Any], str, bool] | None]):
                             allow_blank=False,
                             id="backend",
                         )
+                with Vertical(id="dirs-fields"):
+                    yield Label("Also serve these directories (comma-separated)")
+                    yield Input(
+                        placeholder="/home/you/worktrees/one, /home/you/worktrees/two",
+                        id="extra-dirs",
+                    )
+                    yield Label("Let Amp discover Git checkouts under (comma-separated)")
+                    yield Input(
+                        placeholder="/home/you/code · leave empty to disable", id="discover-dirs"
+                    )
+                    with Horizontal(id="discover-row"):
+                        with Vertical():
+                            yield Label("Discovery depth (1–10)")
+                            yield Input(placeholder="Amp default", id="discover-depth")
+                        with Vertical():
+                            yield Label("Discovery excludes (comma-separated)")
+                            yield Input(placeholder="dotfiles, work/legacy", id="discover-exclude")
                 yield Checkbox("Split NVIDIA GPUs between workers", id="gpu-split")
                 with Vertical(id="outpost-fields"):
                     yield Label("Devin Outpost name")
@@ -282,6 +386,7 @@ class SetupScreen(ModalScreen[tuple[dict[str, Any], str, bool] | None]):
         self.query_one("#instance-name", Input).placeholder = f"e.g. {provider}-personal"
         self.query_one("#outpost-fields").display = provider == "devin"
         self.query_one("#credential-fields").display = provider in ("cursor", "devin")
+        self.query_one("#dirs-fields").display = provider == "amp"
         self.query_one("#credential-label", Label).update(
             "Outpost token (required)"
             if provider == "devin"
@@ -316,9 +421,10 @@ class SetupScreen(ModalScreen[tuple[dict[str, Any], str, bool] | None]):
             source = self.query_one("#source", Input).value.strip()
             if not source:
                 raise FleetError("Enter a repository or local directory.")
+            provider = str(self.query_one("#provider", Select).value)
             payload = {
                 "name": name,
-                "provider": str(self.query_one("#provider", Select).value),
+                "provider": provider,
                 "source": source,
                 "count": count,
                 "label": self.query_one("#runner-label", Input).value.strip(),
@@ -326,8 +432,20 @@ class SetupScreen(ModalScreen[tuple[dict[str, Any], str, bool] | None]):
                 "outpost": self.query_one("#outpost", Input).value.strip(),
                 "gpu_split": self.query_one("#gpu-split", Checkbox).value,
             }
-            if payload["provider"] == "droid":
-                # Validate the local path or clone plan before dismissing the user's form.
+            if provider == "amp":
+                depth = self.query_one("#discover-depth", Input).value.strip()
+                if depth and not depth.isdigit():
+                    raise FleetError("Discovery depth must be a whole number between 1 and 10.")
+                payload |= {
+                    "extra_dirs": split_values(self.query_one("#extra-dirs", Input).value),
+                    "discover_dirs": split_values(self.query_one("#discover-dirs", Input).value),
+                    "discover_depth": int(depth) if depth else 0,
+                    "discover_excludes": split_values(
+                        self.query_one("#discover-exclude", Input).value
+                    ),
+                }
+            if provider in ("amp", "droid"):
+                # Validate paths and the clone plan before dismissing the user's form.
                 make_instance(self.app.manager.store, **payload, preview=True)
             preview = self.query_one("#setup-preview", Checkbox).value
             secret = self.query_one("#secret", Input).value
@@ -357,6 +475,7 @@ class FleetApp(App):
         Binding("q", "quit", "Quit"),
         Binding("ctrl+r", "restart", "Restart", show=False),
         Binding("a", "add", "Add workers", show=False),
+        Binding("e", "dirs", "Directories", show=False),
         Binding("delete", "remove", "Remove worker", show=False),
         Binding("l", "logs", "Logs", show=False),
         Binding("d", "doctor", "Diagnostics", show=False),
@@ -402,6 +521,7 @@ class FleetApp(App):
                     yield Button("Stop", id="stop-worker")
                     yield Button("Restart", id="restart-worker")
                     yield Button("Add", id="add-workers")
+                    yield Button("Dirs", id="dirs")
                     yield Button("Remove", id="remove-worker", variant="error")
                 with TabbedContent(id="details"):
                     with TabPane("Activity", id="activity-tab"):
@@ -596,19 +716,34 @@ class FleetApp(App):
             button.tooltip = (
                 "Legacy worker: read-only. Use the original Bash manager." if readonly else None
             )
+        config = self.configs.get(self.selected)
+        dirs_button = self.query_one("#dirs", Button)
+        dirs_button.disabled = config is None or config.provider != "amp" or readonly
+        dirs_button.tooltip = (
+            "Amp only: serve extra directories or discover Git checkouts."
+            if dirs_button.disabled
+            else None
+        )
         if readonly:
             self.query_one("#context", Static).update(
                 "Legacy PID detected · read-only. Use the original Bash manager."
             )
         else:
+            config = self.configs.get(self.selected)
             self.query_one("#context", Static).update(
-                f"{self.configs[self.selected].runner_id} · "
+                f"{config.runner_id} · "
                 + (
                     "One shared process; a row action affects the whole runner."
-                    if self.configs[self.selected].shared
+                    + (
+                        f" {len(config.extra_dirs)} extra directories, "
+                        f"{len(config.discover_dirs)} discovery roots."
+                        if config.provider == "amp"
+                        else ""
+                    )
+                    if config.shared
                     else "Independent worker processes."
                 )
-                if self.selected in self.configs
+                if config is not None
                 else "Your fleet is empty. Press n to create your first instance. Press ? for help."
             )
 
@@ -665,6 +800,10 @@ class FleetApp(App):
                 else "Prepare workspaces and save configuration. Nothing starts automatically."
             )
         )
+        for path in payload.get("extra_dirs", []):
+            summary += f"\nAlso serves: {path}"
+        for path in payload.get("discover_dirs", []):
+            summary += f"\nDiscovers Git checkouts under: {path}"
         if payload["provider"] == "droid":
             try:
                 config = make_instance(self.manager.store, **payload, preview=True)
@@ -732,6 +871,25 @@ class FleetApp(App):
                 self._perform("add", name=name, count=count, preview=preview) if count else None
             ),
         )
+
+    def action_dirs(self) -> None:
+        if self.demo:
+            self.notify("Demo is read-only.")
+            return
+        config = self.configs.get(self.selected)
+        if config is None:
+            self.notify("Select an instance first.")
+            return
+        if config.provider != "amp":
+            self.notify("Only Amp instances manage extra directories.", severity="warning")
+            return
+
+        def done(request) -> None:
+            if request:
+                action, kwargs = request
+                self._perform(action, name=config.name, **kwargs)
+
+        self.push_screen(DirsScreen(config), done)
 
     def action_remove(self) -> None:
         if self.demo:
@@ -857,6 +1015,12 @@ class FleetApp(App):
             return manager.control(action, **kwargs)
         if action == "add":
             return manager.add(**kwargs)
+        if action == "add_dirs":
+            return manager.add_dirs(**kwargs)
+        if action == "remove_dirs":
+            return manager.remove_dirs(**kwargs)
+        if action == "edit_discovery":
+            return manager.edit_discovery(**kwargs)
         return manager.remove(**kwargs)
 
     @on(Button.Pressed)

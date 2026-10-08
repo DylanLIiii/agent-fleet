@@ -117,11 +117,50 @@ def build_command(
             args.append(f"--token={secret}")
     elif config.provider == "amp":
         args = [executable, "--no-tui", "--runner-id", config.runner_id, "--no-serve-cwd"]
+        # Managed checkouts are startup flags; extra directories are applied with
+        # `amp runner dirs add` so they can also change while the runner is up.
         for worker in config.active_workers:
             args += ["--dir", str(config.worker_dir(home, worker))]
+        if config.discover_dirs:
+            for root in config.discover_dirs:
+                args.append(f"--discover-dirs={root}")
+            if config.discover_depth:
+                args += ["--discover-depth", str(config.discover_depth)]
+            for pattern in config.discover_excludes:
+                args += ["--discover-exclude", pattern]
     else:
         args = [executable, "daemon", "--remote-access"]
     return Command(args, env, directory)
+
+
+def amp_runner(config: Instance) -> dict | None:
+    """The running Amp runner entry for this instance, or None when it is not running."""
+    try:
+        data = json.loads(run([binary("amp"), "runner", "list", "--json"], timeout=5))
+    except (FleetError, ValueError, TypeError, AttributeError):
+        return None
+    for entry in data.get("runners", []):
+        if isinstance(entry, dict) and entry.get("runnerId") == config.runner_id:
+            return entry
+    return None
+
+
+def amp_served_dirs(config: Instance) -> list[str] | None:
+    """Directories the running runner serves, or None when it is not running."""
+    entry = amp_runner(config)
+    if entry is None:
+        return None
+    return [
+        item["path"]
+        for item in entry.get("directories", [])
+        if isinstance(item, dict) and isinstance(item.get("path"), str) and item.get("path")
+    ]
+
+
+def amp_dirs_command(config: Instance, verb: str, paths: list[str]) -> list[str]:
+    if verb not in ("add", "remove"):
+        raise FleetError("Unknown Amp directory action.")
+    return [binary("amp"), "runner", "dirs", verb, "--runner-id", config.runner_id, *paths]
 
 
 def readiness(config: Instance, index: int) -> str:
@@ -135,12 +174,7 @@ def readiness(config: Instance, index: int) -> str:
             ) as response:
                 return "ready" if response.status == 200 else "starting"
         if config.provider == "amp":
-            data = json.loads(run([binary("amp"), "runner", "list", "--json"], timeout=5))
-            return (
-                "local ready"
-                if any(x.get("runnerId") == config.runner_id for x in data.get("runners", []))
-                else "starting"
-            )
+            return "local ready" if amp_runner(config) is not None else "starting"
         if config.provider == "droid":
             data = json.loads(
                 run(

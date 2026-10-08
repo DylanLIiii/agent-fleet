@@ -67,3 +67,60 @@ def test_cli_configure_and_list(store, source):
     data = json.loads(result.output)
     assert len(data) == 2
     assert data[0]["state"] == "stopped"
+
+
+def test_cli_manages_amp_directories(store, source, tmp_path):
+    from agent_fleet.store import Store
+
+    extra = tmp_path / "extra"
+    extra.mkdir()
+    result = runner.invoke(
+        app,
+        [
+            "--home",
+            str(store.home),
+            "setup",
+            "--provider",
+            "amp",
+            "--name",
+            "dirs",
+            "--source",
+            str(source),
+            "--count",
+            "1",
+            "--backend",
+            "process",
+            "--extra-dir",
+            str(extra),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert Store(store.home).load("dirs").extra_dirs == (str(extra.resolve()),)
+    result = runner.invoke(app, ["--home", str(store.home), "--instance", "dirs", "dirs"])
+    assert result.exit_code == 0, result.output
+    assert "extra" in result.output
+    root = tmp_path / "code"
+    root.mkdir()
+    result = runner.invoke(
+        app,
+        [
+            "--home",
+            str(store.home),
+            "--instance",
+            "dirs",
+            "dirs",
+            "discover",
+            str(root),
+            "--depth",
+            "3",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    saved = Store(store.home).load("dirs")
+    assert saved.discover_dirs == (str(root.resolve()),) and saved.discover_depth == 3
+    result = runner.invoke(
+        app,
+        ["--home", str(store.home), "--instance", "dirs", "dirs", "remove", str(extra)],
+    )
+    assert result.exit_code == 0, result.output
+    assert Store(store.home).load("dirs").extra_dirs == ()

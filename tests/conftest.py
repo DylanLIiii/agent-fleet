@@ -41,9 +41,29 @@ def fake_amp(tmp_path: Path, monkeypatch) -> Path:
     script.write_text(
         f"#!{sys.executable}\n"
         "import json, os, sys, time\n"
+        "STATE, CALLS = os.environ['TEST_AMP_DIRS'], os.environ['TEST_AMP_CALLS']\n"
+        "def read():\n"
+        "    try:\n"
+        "        return [line for line in open(STATE).read().splitlines() if line]\n"
+        "    except OSError:\n"
+        "        return []\n"
+        "def write(paths):\n"
+        "    open(STATE, 'w').write(''.join(p + '\\n' for p in dict.fromkeys(paths)))\n"
         "if sys.argv[1:3] == ['runner', 'list']:\n"
-        "    print(json.dumps({'runners': [{'runnerId': 'test-runner'}]}))\n"
+        "    print(json.dumps({'runners': [{'runnerId': 'test-runner', "
+        "'directories': [{'path': p} for p in read()]}]}))\n"
+        "elif sys.argv[1:3] == ['runner', 'dirs']:\n"
+        "    verb, args = sys.argv[3], sys.argv[4:]\n"
+        "    args.remove('--runner-id')\n"
+        "    args.remove('test-runner')\n"
+        "    open(CALLS, 'a').write(verb + ' ' + ' '.join(args) + '\\n')\n"
+        "    write((read() + args) if verb == 'add' else [p for p in read() if p not in args])\n"
+        "    print('ok')\n"
         "else:\n"
+        "    args = sys.argv[1:]\n"
+        "    startup = [args[i + 1] for i, a in enumerate(args) if a == '--dir']\n"
+        "    startup += [a.split('=', 1)[1] for a in args if a.startswith('--discover-dirs=')]\n"
+        "    write(read() + startup)\n"
         "    print('fake worker started', flush=True)\n"
         "    open(os.environ['TEST_CHILD_PID'], 'w').write(str(os.getpid()))\n"
         "    while True: time.sleep(0.1)\n"
@@ -54,7 +74,21 @@ def fake_amp(tmp_path: Path, monkeypatch) -> Path:
     monkeypatch.setenv("PATH", f"{directory}:{os.environ['PATH']}")
     marker = tmp_path / "child.pid"
     monkeypatch.setenv("TEST_CHILD_PID", str(marker))
+    monkeypatch.setenv("TEST_AMP_DIRS", str(tmp_path / "amp-dirs"))
+    monkeypatch.setenv("TEST_AMP_CALLS", str(tmp_path / "amp-calls"))
     return marker
+
+
+@pytest.fixture
+def amp_state(tmp_path: Path) -> Path:
+    """Served-directory state maintained by the fake amp fixture."""
+    return tmp_path / "amp-dirs"
+
+
+@pytest.fixture
+def amp_calls(tmp_path: Path) -> Path:
+    """Directory command log written by the fake amp fixture."""
+    return tmp_path / "amp-calls"
 
 
 @pytest.fixture

@@ -84,6 +84,29 @@ def test_legacy_in_place(store, config):
     assert not (store.home / "fleet.json").exists()
 
 
+def test_legacy_directory_fields_roundtrip(store, config):
+    private_write(
+        store.home / "fleet.env",
+        (
+            f"PROVIDER=amp\nREPO_URL={config.repo_url}\nREPO_NAME=source\n"
+            "RUNNER_ID=test-runner\nWORKER_COUNT=2\nACTIVE_WORKERS=1,2\n"
+            "GPU_SPLIT=no\nUSE_SYSTEMD=no\n"
+            'EXTRA_DIRS=\'["/tmp/one", "/tmp/two"]\'\n'
+            "DISCOVER_DIRS='[\"/tmp/code\"]'\n"
+            "DISCOVER_DEPTH=3\n"
+            "DISCOVER_EXCLUDES='[\"dotfiles\"]'\n"
+        ),
+    )
+    legacy = store.load("amp")
+    assert legacy.extra_dirs == ("/tmp/one", "/tmp/two")
+    assert legacy.discover_dirs == ("/tmp/code",)
+    assert legacy.discover_depth == 3
+    assert legacy.discover_excludes == ("dotfiles",)
+    store.save(replace(legacy, extra_dirs=("/tmp/one",)))
+    assert store.load("amp").extra_dirs == ("/tmp/one",)
+    assert not (store.home / "fleet.json").exists()
+
+
 def test_malformed_native(store, config):
     store.save(config)
     path = store.location("test") / "fleet.json"
