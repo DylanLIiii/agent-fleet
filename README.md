@@ -37,6 +37,7 @@ Setup can prepare configuration and workspaces before a provider CLI is installe
 
 - A dark, restrained dashboard with instance navigation, live process counts and clear readiness.
 - Keyboard and mouse support, searchable command palette (`ctrl+p`), and responsive layouts.
+- The header is noninteractive; clicking its left edge no longer opens the command palette.
 - A guided setup form with provider-specific fields, masked credentials and a review step.
 - Start, stop, restart, add and remove without leaving your terminal.
 - Separate activity, log and health panels. No shell interpretation or Rich markup of log content.
@@ -154,10 +155,23 @@ specifically revision `5f4d34f7c13750210bd6e3e099ee3114cf114055`.
 This is a Python reimplementation, not an execution wrapper.
 
 Existing `fleet.env` files at the Fleet root or under `instances/<name>/` are read
-in place. Their worker names, PID records, service names and management ports are
-preserved. Literal quoted/escaped assignments are parsed **without executing Bash**.
+in place. Configurations from the linked script revision preserve their worker
+names, PID records, service names and management ports. Literal quoted/escaped
+assignments are parsed **without executing Bash**.
 Shell substitutions, custom commands and Bash ANSI-C quotes are not supported.
 Legacy files must have permissions `600` and be owned by you.
+
+Earlier Cursor scripts used `run/<repo>-wN.pid` with only a PID and often permissions
+`644`. Fleet checks the live process's owner, provider, worker name and workspace,
+then displays **legacy running** instead of falsely reporting **stopped**.
+These workers remain **read-only**: Fleet will not signal, replace, remove, or start
+a duplicate while an old record exists. A live PID that fails identity checks is
+shown as **unverified PID**, not running or ready.
+Manage them with the original Bash script. After stopping them, review the old
+records before manually removing them and starting Python-managed workers.
+Fleet never rewrites or adopts old PID-only records automatically.
+Amp still requires its own matching process/service record; no Amp runner is
+started merely because the dashboard reports stopped.
 
 Do not run the Bash and Python managers simultaneously. Do not place both
 `fleet.json` and `fleet.env` in one instance. No migration starts or restarts workers.

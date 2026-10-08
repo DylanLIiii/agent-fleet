@@ -273,3 +273,63 @@ def test_generated_systemd_unit_contains_no_secret(manager, config, tmp_path, mo
     assert "-m" in unit.read_text() and "agent_fleet.runtime" in unit.read_text()
     assert unit.stat().st_mode & 0o777 == 0o600
     manager.control("stop", config.name, "1")
+
+
+def test_legacy_cursor_live_process_is_read_only_not_stopped(legacy_cursor):
+    manager, config, record, process = legacy_cursor
+    before = record.read_bytes(), record.stat().st_mode
+    assert manager.status(config.name, probe=False)[0].state == "legacy running"
+    assert process.poll() is None
+    assert (record.read_bytes(), record.stat().st_mode) == before
+    assert not manager.paths(config, 1)[0].exists()
+
+
+@pytest.mark.parametrize("action", ["start", "stop", "restart", "remove"])
+def test_legacy_cursor_cannot_be_duplicated_or_controlled(legacy_cursor, monkeypatch, action):
+    manager, config, record, process = legacy_cursor
+    monkeypatch.setattr(
+        "agent_fleet.manager.binary", lambda _: pytest.fail("Provider execution for legacy worker")
+    )
+    with pytest.raises(FleetError, match="legacy"):
+        if action == "remove":
+            manager.remove(config.name)
+        else:
+            manager.control(action, config.name)
+    assert process.poll() is None
+    assert record.exists()
+    assert manager.store.load(config.name) == config
+
+
+def test_legacy_pid_does_not_identify_an_unrelated_process(legacy_cursor):
+    manager, config, record, _ = legacy_cursor
+    record.write_text(str(os.getpid()) + "\n")
+    assert manager.status(config.name, probe=False)[0].state == "unverified PID"
+
+
+def test_dead_legacy_record_is_not_reported_running(legacy_cursor):
+    manager, config, record, _ = legacy_cursor
+    record.write_text("999999999\n")
+    assert manager.status(config.name, probe=False)[0].state == "stopped"
+
+
+def test_legacy_symlink_record_is_rejected(legacy_cursor, tmp_path):
+    manager, config, record, _ = legacy_cursor
+    target = tmp_path / "outside-record"
+    target.write_text(record.read_text())
+    record.unlink()
+    record.symlink_to(target)
+    with pytest.raises(FleetError, match="symbolic"):
+        manager.status(config.name, probe=False)
+
+
+def test_legacy_record_writable_by_others_is_rejected(legacy_cursor):
+    manager, config, record, _ = legacy_cursor
+    record.chmod(0o666)
+    with pytest.raises(FleetError, match="Unsafe legacy"):
+        manager.status(config.name, probe=False)
+
+
+def test_legacy_record_with_wrong_process_birth_is_unverified(legacy_cursor):
+    manager, config, record, process = legacy_cursor
+    record.write_text(f"{process.pid} 1\n")
+    assert manager.status(config.name, probe=False)[0].state == "unverified PID"

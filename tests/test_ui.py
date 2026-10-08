@@ -1,5 +1,6 @@
 import pytest
-from textual.widgets import Checkbox, DataTable, Input, Select, Static, TabbedContent
+from textual.command import CommandPalette
+from textual.widgets import Button, Checkbox, DataTable, Input, Select, Static, TabbedContent
 
 from agent_fleet.manager import Manager
 from agent_fleet.ui import ConfirmScreen, FleetApp, HelpScreen, SetupScreen
@@ -105,3 +106,50 @@ async def test_confirmed_preview_does_not_turn_into_real_action(manager, config,
         await pilot.click("#confirm")
         await pilot.pause(0.5)
         assert not manager.running(config, 1)
+
+
+async def test_header_click_never_opens_palette_but_keyboard_does(store):
+    app = FleetApp(Manager(store), demo=True)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        for offset in ((0, 0), (1, 0), (25, 0), (60, 0)):
+            await pilot.click("Header", offset=offset)
+            await pilot.pause()
+            assert not isinstance(app.screen, CommandPalette)
+        await pilot.press("ctrl+p")
+        await pilot.pause()
+        assert isinstance(app.screen, CommandPalette)
+
+
+@pytest.mark.parametrize("size", [(120, 40), (90, 28), (70, 22)])
+async def test_mouse_controls_keep_target_after_refresh(manager, config, size):
+    manager.setup(config)
+    app = FleetApp(manager)
+    async with app.run_test(size=size) as pilot:
+        await pilot.pause()
+        for target in ("#start-worker", "#stop-worker", "#restart-worker"):
+            for _ in range(2):
+                app.action_refresh()
+                await pilot.pause()
+                assert await pilot.click(target)
+                await pilot.pause()
+                assert isinstance(app.screen, ConfirmScreen)
+                await pilot.press("escape")
+        assert not manager.running(config, 1)
+
+
+async def test_legacy_worker_actions_are_read_only_in_dashboard(legacy_cursor):
+    manager, config, record, process = legacy_cursor
+    before = record.read_bytes()
+    app = FleetApp(manager)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        assert app.rows[0].state == "legacy running"
+        for selector in ("#start-worker", "#stop-worker", "#restart-worker", "#remove-worker"):
+            assert app.query_one(selector, Button).disabled
+        await pilot.press("s", "x", "ctrl+r", "delete")
+        await pilot.pause()
+        assert len(app.screen_stack) == 1
+        assert process.poll() is None
+        assert record.read_bytes() == before
+        assert "read-only" in str(app.query_one("#context", Static).render())

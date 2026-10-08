@@ -4,6 +4,7 @@ import math
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -128,13 +129,80 @@ class Manager:
         identity = self._pid(pidfile)
         return identity is not None and process_birth(identity[0]) == identity[1]
 
+    def _legacy_state(self, config: Instance, index: int) -> str | None:
+        if config.provider != "cursor":
+            return None
+        home = self.store.location(config.name)
+        record = home / "run" / f"{config.repo_name}-w{index}.pid"
+        if not record.exists() and not record.is_symlink():
+            return None
+        safe_path(record)
+        try:
+            fd = os.open(record, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd) as stream:
+                info = os.fstat(stream.fileno())
+                # Older scripts wrote 644 PID-only records. They are evidence, never authority.
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != os.getuid()
+                    or info.st_mode & 0o022
+                    or info.st_size > 128
+                ):
+                    raise FleetError(f"Unsafe legacy PID record; inspect it manually: {record}")
+                fields = stream.read().split()
+        except OSError as exc:
+            raise FleetError(f"Cannot inspect legacy PID record: {record}") from exc
+        if len(fields) not in (1, 2) or not all(field.isdigit() for field in fields):
+            return "unverified PID"
+        pid = int(fields[0])
+        birth = process_birth(pid)
+        if birth is None:
+            return "stopped"
+        if len(fields) == 2 and fields[1] != birth:
+            return "unverified PID"
+        try:
+            process = Path(f"/proc/{pid}")
+            if process.stat().st_uid != os.getuid():
+                return "unverified PID"
+            # Arguments may contain credentials. Inspect identity only; never log or retain them.
+            args = [
+                value.decode(errors="replace")
+                for value in (process / "cmdline").read_bytes().split(b"\0")
+                if value
+            ]
+            cursor = any(
+                "cursor-agent" in value or Path(value).name == "agent" for value in args[:3]
+            )
+            worker_name = args[args.index("--name") + 1]
+            worker_dir = args[args.index("--worker-dir") + 1]
+            matches = (
+                cursor
+                and "worker" in args
+                and "start" in args
+                and worker_name in (record.stem, config.worker_name(index))
+                and worker_dir == str(config.worker_dir(home, index))
+                and process_birth(pid) == birth
+            )
+            return "legacy running" if matches else "unverified PID"
+        except (OSError, ValueError, IndexError):
+            return "unverified PID"
+
+    def _require_managed_targets(self, config: Instance, target: str = "all") -> None:
+        for index in config.process_indices(target):
+            if self._legacy_state(config, index) is not None:
+                raise FleetError(
+                    "This worker has a legacy PID record and is read-only. "
+                    "Use the original Bash script to manage it; stop and review the old record "
+                    "before starting a Python-managed worker. No process was changed."
+                )
+
     def status(self, name: str | None = None, *, probe: bool = True) -> list[WorkerStatus]:
         configs = [self.store.load(name)] if name else self.store.all()
         result = []
 
         def evidence(config: Instance, index: int) -> str:
             if not self.running(config, index):
-                return "stopped"
+                return self._legacy_state(config, index) or "stopped"
             return readiness(config, index) if probe else "running"
 
         # Slow provider probes must not serialize hundreds of independent workers.
@@ -240,6 +308,7 @@ class Manager:
             if count < 1 or config.worker_count + count > 128:
                 raise FleetError("Add a positive number of workers, up to 128 total.")
             if config.shared or config.gpu_split:
+                self._require_managed_targets(config)
                 if any(self.running(config, i) for i in config.process_indices()):
                     raise FleetError(
                         "Stop all workers before changing Amp directories or GPU allocation."
@@ -419,6 +488,7 @@ class Manager:
             raise FleetError("Unknown process action.")
         with self.store.lock(self.dry_run):
             config = self.store.select(name)
+            self._require_managed_targets(config, target)
             result = []
             for index in config.process_indices(target):
                 if action in ("stop", "restart"):
@@ -508,6 +578,7 @@ class Manager:
     ) -> list[str]:
         with self.store.lock(self.dry_run):
             config = self.store.select(name)
+            self._require_managed_targets(config, target)
             targets = config.targets(target)
             if delete_checkouts and config.provider != "droid":
                 for index in targets:

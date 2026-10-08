@@ -9,6 +9,7 @@ from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.events import Click
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
@@ -62,6 +63,9 @@ Amp serves several directories; Droid uses one existing directory.
 **Ready** means Cursor's local `/readyz` passed. **Local ready** means Amp's
 runner listing or Droid's local daemon diagnostic passed.
 **Unverified** means Devin is alive but has no worker-specific readiness probe.
+**Legacy running** means an older Cursor PID record matches a live worker, but
+the process is read-only. **Unverified PID** means a legacy record cannot prove
+the worker's identity. Use the original Bash manager for these workers.
 Always confirm remote task dispatch on the provider's platform.
 
 ## Safe by default
@@ -72,6 +76,11 @@ stored with permissions `600`, and omitted from configuration and service units.
 Removal keeps checkouts by default. Optional deletion requires verified ownership,
 a clean checkout (including ignored files), and no unpushed branch commits.
 """
+
+
+class FleetHeader(Header):
+    def _on_click(self, event: Click) -> None:
+        event.stop()
 
 
 class HelpScreen(ModalScreen):
@@ -357,7 +366,7 @@ class FleetApp(App):
         self._loaded_signature: tuple = ()
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
+        yield FleetHeader(show_clock=True)
         with Horizontal(id="workspace"):
             with Vertical(id="sidebar"):
                 yield Label("FLEET / INSTANCES", id="sidebar-title")
@@ -516,7 +525,7 @@ class FleetApp(App):
             process_keys = {
                 (row.instance, 0 if self.configs[row.instance].shared else row.index)
                 for row in rows
-                if row.state != "stopped"
+                if row.state not in ("stopped", "unverified PID")
             }
             self.query_one("#metric-ready", Static).update(f"{len(process_keys)}\nLIVE PROCESSES")
             self.populate_table()
@@ -546,6 +555,8 @@ class FleetApp(App):
             "starting": "#eccb7a",
             "stopped": "#8c99ae",
             "running": "#a6c9ff",
+            "legacy running": "#eccb7a",
+            "unverified PID": "#f3aab1",
         }
         for row in self.visible_rows():
             table.add_row(
@@ -558,16 +569,38 @@ class FleetApp(App):
         if table.row_count:
             table.move_cursor(row=min(old_row, table.row_count - 1))
         self.query_one("#fleet-heading", Label).update(self.selected or "Your control room")
-        self.query_one("#context", Static).update(
-            f"{self.configs[self.selected].runner_id} · "
-            + (
-                "One shared process; a row action affects the whole runner."
-                if self.configs[self.selected].shared
-                else "Independent worker processes."
+        self.update_controls()
+
+    @on(DataTable.RowHighlighted, "#workers")
+    def worker_highlighted(self) -> None:
+        self.update_controls()
+
+    def update_controls(self) -> None:
+        rows = self.visible_rows()
+        index = self.query_one("#workers", DataTable).cursor_row
+        row = rows[index] if 0 <= index < len(rows) else None
+        readonly = row is not None and row.state in ("legacy running", "unverified PID")
+        for selector in ("#start-worker", "#stop-worker", "#restart-worker", "#remove-worker"):
+            button = self.query_one(selector, Button)
+            button.disabled = row is None or readonly
+            button.tooltip = (
+                "Legacy worker: read-only. Use the original Bash manager." if readonly else None
             )
-            if self.selected in self.configs
-            else "Your fleet is empty. Press n to create your first instance. Press ? for help."
-        )
+        if readonly:
+            self.query_one("#context", Static).update(
+                "Legacy PID detected · read-only. Use the original Bash manager."
+            )
+        else:
+            self.query_one("#context", Static).update(
+                f"{self.configs[self.selected].runner_id} · "
+                + (
+                    "One shared process; a row action affects the whole runner."
+                    if self.configs[self.selected].shared
+                    else "Independent worker processes."
+                )
+                if self.selected in self.configs
+                else "Your fleet is empty. Press n to create your first instance. Press ? for help."
+            )
 
     def visible_rows(self) -> list[WorkerStatus]:
         return [row for row in self.rows if row.instance == self.selected]
@@ -636,6 +669,11 @@ class FleetApp(App):
         row = self.selected_worker()
         if row is None:
             return
+        if row.state in ("legacy running", "unverified PID"):
+            self.notify(
+                "Legacy worker is read-only. Use the original Bash manager.", severity="warning"
+            )
+            return
         preview = self.manager.dry_run
         message = f"{action.capitalize()} {row.instance} / worker {row.index}?"
         if self.configs[row.instance].shared:
@@ -682,6 +720,11 @@ class FleetApp(App):
             return
         row = self.selected_worker()
         if row:
+            if row.state in ("legacy running", "unverified PID"):
+                self.notify(
+                    "Legacy worker is read-only. Use the original Bash manager.", severity="warning"
+                )
+                return
             preview = self.manager.dry_run
             self.push_screen(
                 RemoveScreen(self.configs[row.instance], row.index),

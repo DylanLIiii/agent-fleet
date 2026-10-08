@@ -8,7 +8,7 @@ import pytest
 
 from agent_fleet.manager import Manager
 from agent_fleet.model import Instance
-from agent_fleet.store import Store
+from agent_fleet.store import Store, private_write
 
 
 @pytest.fixture
@@ -55,3 +55,49 @@ def fake_amp(tmp_path: Path, monkeypatch) -> Path:
     marker = tmp_path / "child.pid"
     monkeypatch.setenv("TEST_CHILD_PID", str(marker))
     return marker
+
+
+@pytest.fixture
+def legacy_cursor(manager: Manager, source: Path, tmp_path: Path):
+    home = manager.store.location("old-cursor")
+    private_write(
+        home / "fleet.env",
+        (
+            f"PROVIDER=cursor\nREPO_URL={source}\nREPO_NAME=source\n"
+            "WORKER_COUNT=1\nACTIVE_WORKERS=1\nGPU_SPLIT=no\nUSE_SYSTEMD=no\n"
+        ),
+    )
+    config = manager.store.load("old-cursor")
+    workspace = config.worker_dir(home, 1)
+    workspace.mkdir(parents=True)
+    executable = tmp_path / "cursor-agent"
+    executable.write_text(f"#!{sys.executable}\nimport time\nwhile True: time.sleep(0.1)\n")
+    executable.chmod(0o700)
+    process = subprocess.Popen(
+        [
+            str(executable),
+            "worker",
+            "start",
+            "--name",
+            "source-w1",
+            "--worker-dir",
+            str(workspace),
+        ]
+    )
+    record = home / "run/source-w1.pid"
+    record.parent.mkdir()
+    record.write_text(str(process.pid) + "\n")
+    record.chmod(0o644)
+    try:
+        # Wait until /proc contains the exec'd provider rather than the spawning interpreter.
+        import time
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if b"worker\x00start" in Path(f"/proc/{process.pid}/cmdline").read_bytes():
+                break
+            time.sleep(0.01)
+        yield manager, config, record, process
+    finally:
+        process.terminate()
+        process.wait(timeout=3)
