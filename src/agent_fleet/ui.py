@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from threading import Event
 from typing import Any
 
 from rich.text import Text
@@ -815,6 +816,8 @@ class FleetApp(App):
             return
         self.busy = True
         preview = kwargs.setdefault("preview", self.manager.dry_run)
+        clone_cancel = Event()
+        kwargs["_clone_cancel"] = clone_cancel
         self.query_one("#details", TabbedContent).active = "activity-tab"
         self.query_one("#statusbar", Static).update(f"Working: {action}…")
         self.activity(f"{action.capitalize()} requested.")
@@ -825,6 +828,9 @@ class FleetApp(App):
             for message in messages:
                 self.activity(message)
             self.notify("Preview complete." if preview else f"{action.capitalize()} complete.")
+        except asyncio.CancelledError:
+            clone_cancel.set()
+            raise
         except (FleetError, OSError) as exc:
             self.activity(f"Could not complete action: {exc}")
             self.notify(str(exc), severity="error", timeout=8)
@@ -838,6 +844,9 @@ class FleetApp(App):
             self.manager.store,
             dry_run=kwargs.pop("preview"),
             ready_timeout=self.manager.ready_timeout,
+            clone_timeout=self.manager.clone_timeout,
+            progress=lambda message: self.call_from_thread(self.activity, message),
+            clone_cancel=kwargs.pop("_clone_cancel"),
         )
         if action == "setup":
             payload = kwargs["payload"]

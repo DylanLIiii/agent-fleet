@@ -162,6 +162,15 @@ Systemd user services support automatic recovery. To start them after reboot wit
 logging in, enable lingering yourself: `loginctl enable-linger "$USER"`.
 Detached processes require a manual `start` after a machine reboot.
 `READY_TIMEOUT` controls startup readiness timeout in seconds (default: 20).
+`CLONE_TIMEOUT` controls each clone attempt in seconds (default: 300).
+For large repositories, use `CLONE_TIMEOUT=1800 agent-fleet`.
+The dashboard and CLI show Git clone phases and percentages while preparing a workspace.
+Errors identify authentication/access, DNS, transfer, TLS and local disk problems without
+printing Git's raw output, which can contain credentials. Unknown errors remain classified
+as unknown rather than guessed. Transient DNS/transfer failures retry up to three times;
+authentication, disk and timeout failures stop immediately. Failed clones leave no instance
+configuration; their temporary directories are cleaned up and transport processes stopped.
+Quitting the dashboard also cancels an in-progress clone, including a silent Git transfer.
 
 ## Moving from the Bash script
 

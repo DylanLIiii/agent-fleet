@@ -53,7 +53,7 @@ def test_droid_clone_failure_does_not_save_configuration(manager, source, monkey
     def fail_clone(*args, **kwargs):
         raise FleetError("Clone failed")
 
-    monkeypatch.setattr(module, "run", fail_clone)
+    monkeypatch.setattr(module, "clone_repo", fail_clone)
     monkeypatch.setattr(module.time, "sleep", lambda _: None)
     with pytest.raises(FleetError, match="Clone failed"):
         manager.setup(config)

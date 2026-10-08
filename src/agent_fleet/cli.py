@@ -51,9 +51,18 @@ def root(
         raise FleetError("Agent Fleet currently supports Linux (including WSL2).")
     try:
         timeout = float(os.environ.get("READY_TIMEOUT", "20"))
+        clone_timeout = float(os.environ.get("CLONE_TIMEOUT", "300"))
     except ValueError as exc:
-        raise FleetError("READY_TIMEOUT must be a positive number of seconds.") from exc
-    manager = Manager(Store(home), dry_run=dry_run, ready_timeout=timeout)
+        raise FleetError(
+            "READY_TIMEOUT and CLONE_TIMEOUT must be positive numbers of seconds."
+        ) from exc
+    manager = Manager(
+        Store(home),
+        dry_run=dry_run,
+        ready_timeout=timeout,
+        clone_timeout=clone_timeout,
+        progress=lambda message: console.print(Text(message)),
+    )
     ctx.obj = (manager, instance)
     if ctx.invoked_subcommand is None:
         dashboard(manager, demo)

@@ -11,10 +11,13 @@ import sys
 import tempfile
 import time
 from collections import deque
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
+from threading import Event
 
+from agent_fleet.git import CloneError, clone_repo
 from agent_fleet.model import FleetError, Instance, runner_id
 from agent_fleet.providers import binary, gpu_count, readiness, run, systemd_available
 from agent_fleet.store import Store, private_read, private_write, safe_path
@@ -98,12 +101,26 @@ class WorkerStatus:
 
 
 class Manager:
-    def __init__(self, store: Store, *, dry_run: bool = False, ready_timeout: float = 20):
+    def __init__(
+        self,
+        store: Store,
+        *,
+        dry_run: bool = False,
+        ready_timeout: float = 20,
+        clone_timeout: float = 300,
+        progress: Callable[[str], None] | None = None,
+        clone_cancel: Event | None = None,
+    ):
         if not math.isfinite(ready_timeout) or ready_timeout <= 0:
             raise FleetError("Readiness timeout must be positive.")
+        if not math.isfinite(clone_timeout) or clone_timeout <= 0:
+            raise FleetError("Clone timeout must be positive and finite.")
         self.store = store
         self.dry_run = dry_run
         self.ready_timeout = ready_timeout
+        self.clone_timeout = clone_timeout
+        self.progress = progress
+        self.clone_cancel = clone_cancel
 
     def paths(self, config: Instance, index: int) -> tuple[Path, Path, Path]:
         home = self.store.location(config.name)
@@ -269,7 +286,22 @@ class Manager:
                 temporary = Path(tempfile.mkdtemp(prefix=".fleet-clone-", dir=destination.parent))
                 clone = temporary / "repo"
                 try:
-                    run(["git", "clone", "--", config.repo_url, str(clone)], timeout=300)
+                    if self.progress:
+                        self.progress(
+                            f"Cloning workspace {index}, attempt {attempt + 1}/3 "
+                            f"(timeout {self.clone_timeout:g}s)…"
+                        )
+                    clone_repo(
+                        config.repo_url,
+                        clone,
+                        timeout=self.clone_timeout,
+                        progress=self.progress,
+                        cancel=self.clone_cancel,
+                    )
+                    if self.clone_cancel is not None and self.clone_cancel.is_set():
+                        raise CloneError(
+                            "Git clone cancelled. No instance configuration was saved."
+                        )
                     private_write(clone / ".git/agent-fleet-owner", config.runner_id + "\n")
                     safe_path(destination)
                     if destination.exists():
@@ -280,9 +312,11 @@ class Manager:
                         child.rename(destination / child.name)
                     clone.rmdir()
                     break
-                except FleetError:
-                    if attempt == 2:
+                except CloneError as exc:
+                    if not exc.retryable or attempt == 2:
                         raise
+                    if self.progress:
+                        self.progress(f"{exc} Retrying…")
                     time.sleep(1)
                 finally:
                     # Only delete the temporary directory created by this operation.
@@ -302,6 +336,8 @@ class Manager:
             if config.provider == "devin" and not secret and not self.dry_run:
                 raise FleetError("Enter your Devin Outpost token.")
             actions = self._prepare(config)
+            if self.clone_cancel is not None and self.clone_cancel.is_set():
+                raise CloneError("Git clone cancelled. No instance configuration was saved.")
             actions.append(f"Save private configuration for '{config.name}' (not started).")
             if not self.dry_run:
                 if secret:
