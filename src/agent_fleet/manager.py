@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import shutil
 import signal
 import stat
@@ -35,9 +36,15 @@ def make_instance(
     if backend not in ("auto", "process", "systemd"):
         raise FleetError("Choose auto, process or systemd as the backend.")
     if provider == "droid":
-        repo_url, droid_dir = "", str(Path(source).expanduser())
-        repo_name = Path(droid_dir).name
         count = 1
+        if "://" in source or re.fullmatch(r"[^/\s:]+@[^/\s:]+:.+", source):
+            repo_url = source
+            repo_name = source.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
+            repo_name = repo_name.rsplit(":", 1)[-1]
+            droid_dir = str(store.home / "instances" / name / "checkouts" / f"{repo_name}-w1")
+        else:
+            repo_url, droid_dir = "", str(Path(source).expanduser())
+            repo_name = Path(droid_dir).name
     else:
         droid_dir = ""
         local = Path(source).expanduser()
@@ -239,8 +246,14 @@ class Manager:
     def _prepare(self, config: Instance) -> list[str]:
         home = self.store.location(config.name)
         actions = []
-        if config.provider == "droid":
+        if config.provider == "droid" and not config.repo_url:
             return [f"Use existing directory {config.droid_dir}; never clone or delete it."]
+        if config.provider == "droid":
+            expected = home / "checkouts" / f"{config.repo_name}-w1"
+            if Path(config.droid_dir) != expected:
+                raise FleetError(
+                    "Droid clones must stay in this instance's managed checkouts directory."
+                )
         for index in config.active_workers:
             destination = config.repo_dir(home, index)
             safe_path(destination)
@@ -357,7 +370,9 @@ class Manager:
             backend = "systemd" if config.use_systemd else "process"
             return f"Would start {config.key(index)} using {backend}."
         binary(config.provider)
-        if config.provider != "droid":
+        if config.provider == "droid" and not Path(config.droid_dir).is_dir():
+            raise FleetError("Droid working directory is missing. Run repair before starting.")
+        if config.provider != "droid" or config.repo_url:
             for worker in config.active_workers if config.shared else (index,):
                 self._assert_repo(config, config.repo_dir(home, worker))
         if config.provider == "devin" and not self.store.secret(config):
@@ -621,7 +636,7 @@ class Manager:
                 checks.append(("fail", config.name, str(exc)))
             for index in config.active_workers:
                 try:
-                    if config.provider != "droid":
+                    if config.provider != "droid" or config.repo_url:
                         self._assert_repo(
                             config, config.repo_dir(self.store.location(config.name), index)
                         )

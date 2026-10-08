@@ -69,7 +69,7 @@ class Instance:
         if self.provider == "droid":
             if self.worker_count != 1 or not Path(self.droid_dir).is_absolute():
                 raise FleetError("Droid requires one worker and an absolute local directory.")
-            if not Path(self.droid_dir).is_dir():
+            if not Path(self.droid_dir).is_dir() and not self.repo_url:
                 raise FleetError("The Droid working directory does not exist.")
         elif not self.repo_url or self.repo_url.startswith("-"):
             raise FleetError("Enter a Git URL or an existing local repository.")

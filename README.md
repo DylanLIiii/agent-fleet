@@ -52,7 +52,7 @@ Setup can prepare configuration and workspaces before a provider CLI is installe
 | Cursor | One worker per independent checkout, data directory and management port | Local `/readyz` |
 | Devin | One Outpost worker per workspace; repository under `repos/` | Process alive; remote readiness unverified |
 | Amp | **One runner** with repeated `--dir` for all active checkouts | Matching runner in `amp runner list --json` |
-| Droid | **One Computer per Fleet home**, using an existing local directory | Local `daemon.loopback` diagnostic |
+| Droid | **One Computer per Fleet home**, using a local directory or a managed Git clone | Local `daemon.loopback` diagnostic |
 
 Only one Droid registration is supported by the provider per machine. Do not create
 another using a different Fleet home or outside this application.
@@ -99,9 +99,24 @@ agent-fleet --instance cursor-lab remove 1
 
 Use `--backend process` or `--backend systemd` at setup to override auto-detection.
 For Devin, add `--outpost NAME`; the token is requested using a masked prompt.
-For Droid, use `--source /absolute/local/path`; the worker count is always one.
+For Droid, use `--source /absolute/local/path` to reuse a directory, or a Git URL
+to clone it automatically. The worker count is always one:
+
+```console
+agent-fleet setup --provider droid --name droid-project \
+  --source https://github.com/you/project.git
+```
+
+Droid Git sources are cloned into
+`~/.agent-fleet/instances/<name>/checkouts/<repo>-w1` (or your chosen Fleet home).
+The setup review shows this path. Clone failure leaves the instance unconfigured;
+no existing directory is overwritten and nothing starts automatically.
+Droid workspaces are kept on removal, whether reused or cloned.
+
+![Droid Git URL setup review](assets/droid-setup.png)
+
 Pass an existing local Git directory as `--source` to derive its origin and prepare
-independent clones. Existing source directories are never adopted or overwritten.
+independent Cursor/Devin/Amp clones. Existing source directories are never overwritten.
 
 `--gpu-split` sets `CUDA_VISIBLE_DEVICES` for independent Cursor/Devin workers,
 including an empty value for workers without an assigned GPU. Amp's single process
@@ -120,7 +135,7 @@ It must be an absolute, non-root path with no symlink components.
     fleet.json             # configuration, permissions 600
     cursor-api-key         # optional private credential
     devin-token            # private credential
-    checkouts/             # Cursor / Amp independent clones
+    checkouts/             # Cursor / Amp / Git-source Droid clones
     devin-workers/         # Devin workers, each containing repos/
     data/                  # isolated Cursor data directories
     run/                   # PID + Linux process birth-time identity

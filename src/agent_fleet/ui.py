@@ -278,6 +278,7 @@ class SetupScreen(ModalScreen[tuple[dict[str, Any], str, bool] | None]):
 
     def update_provider(self, provider: str) -> None:
         self.query_one("#provider-guidance", Static).update(GUIDANCE[provider])
+        self.query_one("#instance-name", Input).placeholder = f"e.g. {provider}-personal"
         self.query_one("#outpost-fields").display = provider == "devin"
         self.query_one("#credential-fields").display = provider in ("cursor", "devin")
         self.query_one("#credential-label", Label).update(
@@ -286,9 +287,14 @@ class SetupScreen(ModalScreen[tuple[dict[str, Any], str, bool] | None]):
             else "API key (optional if CLI is logged in)"
         )
         self.query_one("#source-label", Label).update(
-            "Existing local directory (absolute path)"
+            "Git URL to clone, or existing local directory (absolute path)"
             if provider == "droid"
             else "Git URL or existing local Git directory"
+        )
+        self.query_one("#source", Input).placeholder = (
+            "https://github.com/you/project.git or /path/to/project"
+            if provider == "droid"
+            else "git@github.com:you/project.git"
         )
         self.query_one("#worker-count", Input).disabled = provider == "droid"
         self.query_one("#worker-count", Input).value = "1" if provider == "droid" else "4"
@@ -319,6 +325,9 @@ class SetupScreen(ModalScreen[tuple[dict[str, Any], str, bool] | None]):
                 "outpost": self.query_one("#outpost", Input).value.strip(),
                 "gpu_split": self.query_one("#gpu-split", Checkbox).value,
             }
+            if payload["provider"] == "droid":
+                # Validate the local path or clone plan before dismissing the user's form.
+                make_instance(self.app.manager.store, **payload, preview=True)
             preview = self.query_one("#setup-preview", Checkbox).value
             secret = self.query_one("#secret", Input).value
             if payload["provider"] == "devin" and not secret and not preview:
@@ -655,6 +664,15 @@ class FleetApp(App):
                 else "Prepare workspaces and save configuration. Nothing starts automatically."
             )
         )
+        if payload["provider"] == "droid":
+            try:
+                config = make_instance(self.manager.store, **payload, preview=True)
+            except FleetError as exc:
+                self.notify(str(exc), severity="error", timeout=8)
+                return
+            summary += f"\n\nLocal workspace: {config.droid_dir}"
+            if config.repo_url:
+                summary += "\nClone first; save the instance only if cloning succeeds."
 
         def confirmed(yes: bool) -> None:
             if yes:
@@ -802,6 +820,8 @@ class FleetApp(App):
         self.activity(f"{action.capitalize()} requested.")
         try:
             messages = await asyncio.to_thread(self._execute, action, kwargs)
+            if action == "setup" and not preview:
+                self.selected = kwargs["payload"]["name"]
             for message in messages:
                 self.activity(message)
             self.notify("Preview complete." if preview else f"{action.capitalize()} complete.")
