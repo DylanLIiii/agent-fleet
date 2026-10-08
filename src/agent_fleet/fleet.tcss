@@ -1,0 +1,254 @@
+Screen {
+    background: #0b1019;
+    color: #dce5f3;
+}
+Header {
+    background: #141e2e;
+    color: #c5d6f3;
+}
+Footer {
+    background: #141e2e;
+}
+#workspace {
+    height: 1fr;
+}
+#sidebar {
+    width: 27;
+    background: #101825;
+    padding: 1;
+    border-right: solid #26354b;
+}
+#sidebar-title {
+    color: #91a8ce;
+    text-style: bold;
+    margin-bottom: 1;
+}
+#instances {
+    height: 1fr;
+    background: transparent;
+}
+ListItem {
+    padding: 1;
+    height: 4;
+    color: #aebed7;
+}
+ListView:focus > ListItem.-highlight, ListItem.-highlight {
+    background: #203650;
+    color: #dce5f3;
+}
+#new-instance {
+    width: 100%;
+}
+#sidebar-note {
+    color: #687e9e;
+    margin-top: 1;
+    height: 2;
+}
+#main {
+    padding: 1 2 0 2;
+}
+#metrics {
+    height: 5;
+    margin-bottom: 1;
+}
+.metric {
+    width: 1fr;
+    height: 5;
+    padding: 0 2;
+    background: #111d2b;
+    color: #b5cef4;
+    border: round #2b405c;
+    margin-right: 1;
+    text-style: bold;
+}
+#metric-ready {
+    color: #76ddab;
+    margin-right: 0;
+}
+#section-heading {
+    height: 3;
+}
+#fleet-heading {
+    width: 1fr;
+    padding-top: 1;
+    text-style: bold;
+    color: #e4edfa;
+}
+#preview {
+    background: transparent;
+    border: none;
+    width: auto;
+}
+#context {
+    height: 2;
+    color: #8d9fba;
+}
+#workers {
+    height: 1fr;
+    min-height: 5;
+    background: #0e1723;
+    border: round #263b54;
+}
+DataTable > .datatable--header {
+    background: #172638;
+    color: #a5bfdf;
+    text-style: bold;
+}
+DataTable > .datatable--cursor {
+    background: #243c58;
+    color: #e4edfa;
+}
+#actions {
+    height: 3;
+    margin-top: 1;
+}
+#actions Button {
+    min-width: 10;
+    width: 1fr;
+    margin-right: 1;
+}
+Button {
+    background: #1b2a3e;
+    border: none;
+    color: #bdcce2;
+}
+Button.-primary {
+    background: #315f96;
+    color: #f0f6ff;
+}
+Button.-success {
+    background: #214a43;
+    color: #a1f3c9;
+}
+Button.-error {
+    background: #472b39;
+    color: #f3b6bd;
+}
+Button:focus {
+    text-style: bold;
+    border: tall #8eb9f4;
+}
+#details {
+    height: 10;
+    margin-top: 1;
+}
+TabPane {
+    padding: 0;
+}
+RichLog {
+    background: #0e1723;
+    color: #9aacc8;
+    padding: 0 1;
+}
+Tabs {
+    background: #101c2a;
+}
+#statusbar {
+    height: 1;
+    color: #6f87ab;
+}
+.compact #sidebar {
+    width: 21;
+}
+.compact #main {
+    padding: 0 1;
+}
+.compact #metrics {
+    height: 4;
+    margin-bottom: 0;
+}
+.compact .metric {
+    height: 4;
+    padding: 0 1;
+}
+.compact #details {
+    height: 7;
+    margin-top: 0;
+}
+.compact #context {
+    height: 1;
+}
+.compact #actions Button {
+    min-width: 7;
+    margin-right: 0;
+}
+.small #metrics {
+    display: none;
+}
+.small #sidebar {
+    width: 18;
+}
+.small #sidebar-note {
+    display: none;
+}
+.small #details {
+    height: 6;
+}
+.small #actions {
+    margin-top: 0;
+}
+ModalScreen {
+    align: center middle;
+    background: #050a12 80%;
+}
+#setup-dialog, #confirm-dialog, #add-dialog, #remove-dialog, #help-dialog {
+    width: 72;
+    max-width: 95%;
+    height: auto;
+    max-height: 95%;
+    padding: 1 2;
+    background: #111d2b;
+    border: round #42638e;
+}
+#setup-dialog, #help-dialog {
+    height: 90%;
+}
+.dialog-title {
+    text-style: bold;
+    color: #d9e8ff;
+    margin-bottom: 1;
+}
+.muted {
+    color: #8fa5c5;
+    margin-bottom: 1;
+}
+#setup-fields {
+    height: 1fr;
+}
+#setup-fields Label {
+    margin-top: 1;
+    color: #b0c3dd;
+}
+Input, Select {
+    width: 100%;
+    background: #0c1521;
+    border: tall #273c57;
+}
+Input:focus {
+    border: tall #89b7f0;
+}
+#capacity-row {
+    height: 5;
+}
+#capacity-row > Vertical {
+    width: 1fr;
+}
+#credential-fields, #outpost-fields {
+    height: auto;
+}
+.dialog-actions {
+    height: 3;
+    margin-top: 1;
+    align-horizontal: right;
+}
+.dialog-actions Button {
+    margin-left: 1;
+}
+.error {
+    color: #f3aab1;
+    height: auto;
+    margin-top: 1;
+}
+#help-dialog VerticalScroll {
+    height: 1fr;
+}
