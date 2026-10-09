@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from threading import Event
 from typing import Any
@@ -71,6 +73,8 @@ runner listing or Droid's local daemon diagnostic passed.
 the process is read-only. **Unverified PID** means a legacy record cannot prove
 the worker's identity. Use the original Bash manager for these workers.
 Always confirm remote task dispatch on the provider's platform.
+Process checks update automatically every 10 seconds. Press `r` to refresh
+readiness evidence; automatic checks do not repeatedly probe provider endpoints.
 
 ## Safe by default
 
@@ -117,7 +121,7 @@ class ConfirmScreen(ModalScreen[bool]):
     def compose(self) -> ComposeResult:
         with Vertical(id="confirm-dialog"):
             yield Label(self.heading, classes="dialog-title")
-            yield Static(self.message, markup=False)
+            yield Static(self.message, id="confirm-message", markup=False)
             with Horizontal(classes="dialog-actions"):
                 yield Button("Cancel", id="cancel")
                 yield Button(
@@ -298,6 +302,7 @@ class SetupScreen(ModalScreen[tuple[dict[str, Any], str, bool] | None]):
     def __init__(self, *, preview: bool = False):
         super().__init__()
         self.preview = preview
+        self._current_provider: str | None = None
 
     def compose(self) -> ComposeResult:
         with Vertical(id="setup-dialog"):
@@ -364,6 +369,10 @@ class SetupScreen(ModalScreen[tuple[dict[str, Any], str, bool] | None]):
                         password=True,
                         id="secret",
                     )
+                    yield Static(
+                        "Credentials are cleared when you switch providers.",
+                        classes="muted",
+                    )
                 yield Checkbox(
                     "Preview only, do not create anything", value=self.preview, id="setup-preview"
                 )
@@ -382,6 +391,10 @@ class SetupScreen(ModalScreen[tuple[dict[str, Any], str, bool] | None]):
             self.update_provider(event.value)
 
     def update_provider(self, provider: str) -> None:
+        if self._current_provider is not None and provider != self._current_provider:
+            self.query_one("#secret", Input).value = ""
+            self.query_one("#outpost", Input).value = ""
+        self._current_provider = provider
         self.query_one("#provider-guidance", Static).update(GUIDANCE[provider])
         self.query_one("#instance-name", Input).placeholder = f"e.g. {provider}-personal"
         self.query_one("#outpost-fields").display = provider == "devin"
@@ -429,7 +442,9 @@ class SetupScreen(ModalScreen[tuple[dict[str, Any], str, bool] | None]):
                 "count": count,
                 "label": self.query_one("#runner-label", Input).value.strip(),
                 "backend": str(self.query_one("#backend", Select).value),
-                "outpost": self.query_one("#outpost", Input).value.strip(),
+                "outpost": (
+                    self.query_one("#outpost", Input).value.strip() if provider == "devin" else ""
+                ),
                 "gpu_split": self.query_one("#gpu-split", Checkbox).value,
             }
             if provider == "amp":
@@ -451,6 +466,8 @@ class SetupScreen(ModalScreen[tuple[dict[str, Any], str, bool] | None]):
             secret = self.query_one("#secret", Input).value
             if payload["provider"] == "devin" and not secret and not preview:
                 raise FleetError("Enter the Outpost token, or choose preview only.")
+            if payload["provider"] not in ("cursor", "devin"):
+                secret = ""
             self.dismiss((payload, secret, preview))
         except (FleetError, ValueError) as exc:
             self.query_one("#setup-error", Static).update(
@@ -492,6 +509,8 @@ class FleetApp(App):
         self.rows: list[WorkerStatus] = []
         self.busy = False
         self.refreshing = False
+        self._refresh_requested = False
+        self._last_probe_at: datetime | None = None
         self._loaded_signature: tuple = ()
 
     def compose(self) -> ComposeResult:
@@ -509,7 +528,11 @@ class FleetApp(App):
                     yield Static("0\nLIVE PROCESSES", id="metric-ready", classes="metric")
                 with Horizontal(id="section-heading"):
                     yield Label("Your control room", id="fleet-heading")
+                    yield Select(
+                        [], prompt="Select instance", allow_blank=True, id="compact-instance"
+                    )
                     yield Checkbox("Preview mode", value=self.manager.dry_run, id="preview")
+                    yield Button("+ New", id="compact-new-instance", variant="primary")
                 yield Static(
                     "Select a worker. Shared Amp/Droid runners are controlled as one process.",
                     id="context",
@@ -531,6 +554,11 @@ class FleetApp(App):
                     with TabPane("Health", id="health-tab"):
                         yield RichLog(id="health", wrap=True, markup=False)
                 yield Static("Loading your fleet…", id="statusbar", markup=False)
+        yield Static(
+            "n New  s Start  x Stop  r Refresh  ? Help  q Quit",
+            id="compact-hints",
+            markup=False,
+        )
         yield Footer()
 
     def on_mount(self) -> None:
@@ -543,18 +571,21 @@ class FleetApp(App):
         self.action_refresh()
         if self.setup_on_launch:
             self.call_after_refresh(self.action_new)
-        self.set_interval(5, self._auto_refresh)
+        self.set_interval(10, self._refresh_timer)
 
     def on_resize(self, event) -> None:
-        self.screen.set_class(event.size.width < 100, "compact")
-        self.screen.set_class(event.size.width < 80 or event.size.height < 25, "small")
+        for screen in self.screen_stack:
+            screen.set_class(event.size.width < 100, "compact")
+            screen.set_class(event.size.width < 80 or event.size.height < 25, "small")
+        if self.configs:
+            self.populate_table()
 
     def activity(self, message: str) -> None:
         self.query_one("#activity", RichLog).write(Text(message))
 
-    def _auto_refresh(self) -> None:
+    def _refresh_timer(self) -> None:
         if not self.busy and len(self.screen_stack) == 1:
-            self.action_refresh()
+            self.action_refresh(probe=False, manual=False)
 
     def _sample(self) -> tuple[list[Instance], list[WorkerStatus]]:
         configs = [
@@ -617,24 +648,39 @@ class FleetApp(App):
         return configs, rows
 
     @work(group="refresh")
-    async def action_refresh(self) -> None:
-        if self.busy or self.refreshing:
+    async def action_refresh(self, *, probe: bool = True, manual: bool = True) -> None:
+        statusbar = self.query_one("#statusbar", Static)
+        if self.busy:
+            if manual:
+                statusbar.update("Action in progress; fleet status will refresh when it completes.")
+            return
+        if self.refreshing:
+            if manual:
+                self._refresh_requested = True
+                statusbar.update("Refresh queued; waiting for the current status check…")
             return
         self.refreshing = True
+        probe_readiness = probe and not self.manager.dry_run and not self.demo
+        statusbar.update(
+            "Refreshing processes and readiness…" if probe_readiness else "Checking process status…"
+        )
         try:
             if self.demo:
                 configs, rows = self._sample()
             else:
                 configs = await asyncio.to_thread(self.manager.store.all)
-                rows = await asyncio.to_thread(self.manager.status, probe=not self.manager.dry_run)
+                rows = await asyncio.to_thread(self.manager.status, probe=probe_readiness)
+                if not probe_readiness:
+                    rows = self._preserve_cached_readiness(rows)
             if self.busy:
                 return
             self.configs = {c.name: c for c in configs}
-            self.rows = rows
+            if self.selected not in self.configs:
+                self.selected = configs[0].name if configs else None
             signature = tuple((c.name, c.provider, len(c.active_workers)) for c in configs)
+            listing = self.query_one("#instances", ListView)
             if signature != self._loaded_signature:
                 self._loaded_signature = signature
-                listing = self.query_one("#instances", ListView)
                 await listing.clear()
                 for config in configs:
                     await listing.append(
@@ -646,10 +692,11 @@ class FleetApp(App):
                             name=config.name,
                         )
                     )
-                if self.selected not in self.configs:
-                    self.selected = configs[0].name if configs else None
-                if configs:
-                    listing.index = [c.name for c in configs].index(self.selected)
+            if configs:
+                listing.index = [c.name for c in configs].index(self.selected)
+            self._sync_instance_picker()
+            self.rows = rows
+            self.populate_table()
             self.query_one("#metric-instances", Static).update(f"{len(configs)}\nINSTANCES")
             self.query_one("#metric-workers", Static).update(f"{len(rows)}\nWORKSPACES")
             process_keys = {
@@ -658,21 +705,57 @@ class FleetApp(App):
                 if row.state not in ("stopped", "unverified PID")
             }
             self.query_one("#metric-ready", Static).update(f"{len(process_keys)}\nLIVE PROCESSES")
-            self.populate_table()
-            self.query_one("#statusbar", Static).update(
-                "DEMO / READ ONLY"
-                if self.demo
-                else "PREVIEW / No changes will be made"
-                if self.manager.dry_run
-                else f"Fleet home: {self.manager.store.home} · Refreshes every 5s"
-            )
+            if probe_readiness:
+                self._last_probe_at = datetime.now()
+            statusbar.update(self._status_message())
         except (FleetError, OSError) as exc:
             self.notify(str(exc), severity="error", timeout=8)
-            self.query_one("#statusbar", Static).update(
-                "Could not load fleet. Fix configuration, then press r."
-            )
+            statusbar.update("Could not load fleet. Fix configuration, then press r.")
         finally:
             self.refreshing = False
+            if self._refresh_requested and not self.busy:
+                self._refresh_requested = False
+                self.call_after_refresh(self.action_refresh)
+
+    def _preserve_cached_readiness(self, rows: list[WorkerStatus]) -> list[WorkerStatus]:
+        readiness_states = {"ready", "local ready", "unverified", "starting"}
+        previous = {(row.instance, row.index): row.state for row in self.rows}
+        return [
+            replace(row, state=previous[(row.instance, row.index)])
+            if row.state == "running"
+            and previous.get((row.instance, row.index)) in readiness_states
+            else row
+            for row in rows
+        ]
+
+    def _sync_instance_picker(self) -> None:
+        picker = self.query_one("#compact-instance", Select)
+        picker.set_options(
+            [
+                (f"{config.name} · {config.provider.upper()}", config.name)
+                for config in self.configs.values()
+            ]
+        )
+        if self.selected in self.configs:
+            picker.value = self.selected
+        else:
+            picker.clear()
+
+    def _status_message(self) -> str:
+        if self.demo:
+            return "DEMO / READ ONLY"
+        if self.manager.dry_run:
+            if self.screen.has_class("small"):
+                return "PREVIEW / No changes · readiness probes disabled"
+            return "PREVIEW / No changes · process checks every 10s · readiness probes disabled"
+        readiness = (
+            f"readiness checked {self._last_probe_at:%H:%M}"
+            if self._last_probe_at is not None
+            else "press r to check readiness"
+        )
+        if self.screen.has_class("small"):
+            return f"Live checks every 10s · {readiness}"
+        return f"Fleet home: {self.manager.store.home} · Live checks every 10s · {readiness}"
 
     def populate_table(self) -> None:
         table = self.query_one("#workers", DataTable)
@@ -689,11 +772,14 @@ class FleetApp(App):
             "unverified PID": "#f3aab1",
         }
         for row in self.visible_rows():
+            workspace = (
+                row.directory.name if self.screen.has_class("compact") else str(row.directory)
+            )
             table.add_row(
                 f"{self.configs[row.instance].repo_name} / w{row.index}",
                 row.provider.capitalize(),
                 Text(row.state, style=colors.get(row.state, "white")),
-                str(row.directory),
+                workspace,
                 key=str(row.index),
             )
         if table.row_count:
@@ -761,6 +847,18 @@ class FleetApp(App):
     @on(ListView.Selected, "#instances")
     def instance_selected(self, event: ListView.Selected) -> None:
         self.selected = event.item.name
+        self.query_one("#compact-instance", Select).value = self.selected
+        self.populate_table()
+
+    @on(Select.Changed, "#compact-instance")
+    def compact_instance_changed(self, event: Select.Changed) -> None:
+        if not isinstance(event.value, str) or event.value not in self.configs:
+            return
+        if event.value == self.selected:
+            return
+        self.selected = event.value
+        listing = self.query_one("#instances", ListView)
+        listing.index = [config.name for config in self.configs.values()].index(self.selected)
         self.populate_table()
 
     @on(Checkbox.Changed, "#preview")
@@ -790,20 +888,46 @@ class FleetApp(App):
         if result is None:
             return
         payload, secret, preview = result
-        summary = (
-            f"Provider: {payload['provider'].capitalize()}\nInstance: {payload['name']}\n"
-            f"Workspace: {payload['source']}\nWorkers: {payload['count']}\n"
-            f"Backend: {payload['backend']}\n\n"
-            + (
+        backend_names = {
+            "auto": "Auto-detect",
+            "process": "Detached process",
+            "systemd": "systemd user service",
+        }
+        summary_lines = [
+            f"Provider: {payload['provider'].capitalize()}",
+            f"Instance: {payload['name']}",
+            f"Workspace source: {payload['source']}",
+            f"Workers / checkouts: {payload['count']}",
+            f"Runner label: {payload.get('label') or 'Default for this host'}",
+            f"Backend preference: {backend_names[payload['backend']]}",
+            f"GPU split: {'enabled' if payload.get('gpu_split') else 'off'}",
+        ]
+        if payload["provider"] == "devin":
+            summary_lines.append(f"Outpost: {payload['outpost']}")
+        if payload["provider"] == "amp":
+            summary_lines.extend(
+                (
+                    "Extra directories: " + (", ".join(payload.get("extra_dirs", [])) or "none"),
+                    "Discovery roots: " + (", ".join(payload.get("discover_dirs", [])) or "none"),
+                    "Discovery depth: "
+                    + (
+                        str(payload["discover_depth"])
+                        if payload.get("discover_depth")
+                        else "Amp default"
+                    ),
+                    "Discovery excludes: "
+                    + (", ".join(payload.get("discover_excludes", [])) or "none"),
+                )
+            )
+        summary_lines.extend(
+            (
+                "",
                 "Preview only. No files, credentials or processes will change."
                 if preview
-                else "Prepare workspaces and save configuration. Nothing starts automatically."
+                else "Prepare workspaces and save configuration. Nothing starts automatically.",
             )
         )
-        for path in payload.get("extra_dirs", []):
-            summary += f"\nAlso serves: {path}"
-        for path in payload.get("discover_dirs", []):
-            summary += f"\nDiscovers Git checkouts under: {path}"
+        summary = "\n".join(summary_lines)
         if payload["provider"] == "droid":
             try:
                 config = make_instance(self.manager.store, **payload, preview=True)
@@ -918,12 +1042,25 @@ class FleetApp(App):
                 ),
             )
 
+    @on(TabbedContent.TabActivated, "#details")
+    def details_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+        if event.pane.id == "logs-tab":
+            self._load_logs()
+        elif event.pane.id == "health-tab":
+            self._load_doctor()
+
+    def action_logs(self) -> None:
+        details = self.query_one("#details", TabbedContent)
+        if details.active == "logs-tab":
+            self._load_logs()
+        else:
+            details.active = "logs-tab"
+
     @work(exclusive=True, group="read-details")
-    async def action_logs(self) -> None:
+    async def _load_logs(self) -> None:
         row = self.selected_worker()
         if row is None:
             return
-        self.query_one("#details", TabbedContent).active = "logs-tab"
         log = self.query_one("#logs", RichLog)
         log.clear()
         try:
@@ -942,9 +1079,15 @@ class FleetApp(App):
         except (FleetError, OSError) as exc:
             log.write(Text(str(exc), style="red"))
 
+    def action_doctor(self) -> None:
+        details = self.query_one("#details", TabbedContent)
+        if details.active == "health-tab":
+            self._load_doctor()
+        else:
+            details.active = "health-tab"
+
     @work(exclusive=True, group="read-details")
-    async def action_doctor(self) -> None:
-        self.query_one("#details", TabbedContent).active = "health-tab"
+    async def _load_doctor(self) -> None:
         log = self.query_one("#health", RichLog)
         log.clear()
         try:
@@ -994,6 +1137,7 @@ class FleetApp(App):
             self.notify(str(exc), severity="error", timeout=8)
         finally:
             self.busy = False
+            self._refresh_requested = False
             self.action_refresh()
 
     def _execute(self, action: str, kwargs) -> list[str]:
@@ -1027,10 +1171,12 @@ class FleetApp(App):
     def button_pressed(self, event: Button.Pressed) -> None:
         actions = {
             "new-instance": self.action_new,
+            "compact-new-instance": self.action_new,
             "start-worker": self.action_start,
             "stop-worker": self.action_stop,
             "restart-worker": self.action_restart,
             "add-workers": self.action_add,
+            "dirs": self.action_dirs,
             "remove-worker": self.action_remove,
         }
         if callback := actions.get(event.button.id):

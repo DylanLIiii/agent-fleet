@@ -370,6 +370,10 @@ class Manager:
                 raise FleetError("Only one Droid Computer can be registered per machine.")
             if config.provider == "devin" and not secret and not self.dry_run:
                 raise FleetError("Enter your Devin Outpost token.")
+            if secret and config.provider not in ("cursor", "devin"):
+                raise FleetError("This provider uses its CLI login, not a Fleet credential.")
+            if secret and ("\n" in secret or "\r" in secret):
+                raise FleetError("Credential must be a nonempty single line.")
             actions = self._prepare(config)
             if self.clone_cancel is not None and self.clone_cancel.is_set():
                 raise CloneError("Git clone cancelled. No instance configuration was saved.")

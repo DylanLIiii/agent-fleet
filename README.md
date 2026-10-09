@@ -37,6 +37,7 @@ Setup can prepare configuration and workspaces before a provider CLI is installe
 
 - A dark, restrained dashboard with instance navigation, live process counts and clear readiness.
 - Keyboard and mouse support, searchable command palette (`ctrl+p`), and responsive layouts.
+- Process liveness updates every 10 seconds; press `r` to refresh readiness evidence.
 - The header is noninteractive; clicking its left edge no longer opens the command palette.
 - A guided setup form with provider-specific fields, masked credentials and a review step.
 - Start, stop, restart, add and remove without leaving your terminal.
@@ -69,7 +70,7 @@ tasks. Confirm dispatch on the provider platform.
 | `a` | Add workers to selected instance |
 | `e` | Manage Amp directories |
 | `delete` | Remove selected worker |
-| `r` | Refresh |
+| `r` | Refresh process status and readiness |
 | `l` / `d` | Logs / health |
 | `p` | Toggle preview mode |
 | `?` | Help |

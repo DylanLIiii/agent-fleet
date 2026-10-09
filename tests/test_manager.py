@@ -38,6 +38,24 @@ def test_setup_never_overwrites(manager, config):
     assert manager.store.load(config.name) == config
 
 
+def test_setup_rejects_unsupported_credentials_before_preparing_workspaces(manager, config):
+    amp = make_instance(
+        manager.store,
+        name="stale-credential",
+        provider="amp",
+        source=config.repo_url,
+        count=1,
+        backend="process",
+    )
+    checkout = amp.worker_dir(manager.store.location(amp.name), 1)
+
+    with pytest.raises(FleetError, match="uses its CLI login"):
+        manager.setup(amp, secret="credential-from-another-provider")
+
+    assert not checkout.exists()
+    assert not (manager.store.location(amp.name) / "fleet.json").exists()
+
+
 def test_repair_preserves_existing_data(manager, config):
     manager.setup(config)
     repo = config.repo_dir(manager.store.location(config.name), 1)
