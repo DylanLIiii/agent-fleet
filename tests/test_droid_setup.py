@@ -184,6 +184,7 @@ def test_droid_daemon_uses_cloned_working_directory(manager, source, tmp_path, m
         "    print(json.dumps({'results': [{'id': 'daemon.loopback', 'status': 'pass'}]}))\n"
         "else:\n"
         "    open(os.environ['TEST_DROID_CWD'], 'w').write(os.getcwd())\n"
+        "    print('[droid daemon] Daemon is running', flush=True)\n"
         "    while True: time.sleep(0.1)\n"
     )
     executable.chmod(0o700)
@@ -198,3 +199,145 @@ def test_droid_daemon_uses_cloned_working_directory(manager, source, tmp_path, m
         assert manager.running(config, 1)
     finally:
         manager.control("stop", config.name)
+
+
+def test_droid_readiness_rejects_loopback_only_when_daemon_exits(
+    manager, source, tmp_path, monkeypatch
+):
+    import os
+    import sys
+
+    binary_dir = tmp_path / "bin"
+    binary_dir.mkdir()
+    executable = binary_dir / "droid"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys, time\n"
+        "if sys.argv[1:2] == ['doctor']:\n"
+        "    print(json.dumps({'results': [{'id': 'daemon.loopback', 'status': 'pass'}]}))\n"
+        "else:\n"
+        "    time.sleep(0.6)\n"
+        "    print('Startup failed: Authentication token expired.', flush=True)\n"
+        "    sys.exit(1)\n"
+    )
+    executable.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{binary_dir}:{os.environ['PATH']}")
+    config = planned_droid(manager, source)
+    manager.setup(config)
+    with pytest.raises(FleetError, match="Authentication token expired"):
+        manager.control("start", config.name)
+    assert not manager.running(config, 1)
+
+
+def test_droid_auto_registers_computer_on_first_start(manager, source, tmp_path, monkeypatch):
+    import os
+    import sys
+
+    binary_dir = tmp_path / "bin"
+    binary_dir.mkdir()
+    reg_marker = tmp_path / "registered"
+    executable = binary_dir / "droid"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import json, pathlib, sys, time\n"
+        f"reg = pathlib.Path({str(reg_marker)!r})\n"
+        "if sys.argv[1:2] == ['doctor']:\n"
+        "    print(json.dumps({'results': [{'id': 'daemon.loopback', 'status': 'pass'}]}))\n"
+        "elif sys.argv[1:3] == ['computer', 'register']:\n"
+        "    assert '-y' in sys.argv\n"
+        "    reg.write_text('agent-fleet-box')\n"
+        "    print('Registered computer agent-fleet-box', flush=True)\n"
+        "else:\n"
+        "    assert '--remote-control' in sys.argv\n"
+        "    if not reg.exists():\n"
+        "        print('Remote access requires a registered computer. "
+        "Run `droid computer register` first.', flush=True)\n"
+        "        sys.exit(1)\n"
+        "    print('[droid daemon] Daemon is running', flush=True)\n"
+        "    print('  Version: 0.240.0', flush=True)\n"
+        "    print('  Relay: wss://relay.factory.ai/v0/computer/uuid-1/agent "
+        "(Computer: agent-fleet-box, ID: uuid-1)', flush=True)\n"
+        "    while True: time.sleep(0.1)\n"
+    )
+    executable.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{binary_dir}:{os.environ['PATH']}")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    config = planned_droid(manager, source)
+    manager.setup(config)
+    try:
+        manager.control("start", config.name)
+        assert reg_marker.exists()
+        assert manager.running(config, 1)
+        assert manager.status(config.name)[0].state == "local ready"
+        assert "agent-fleet-box" in manager.droid_identity(config)
+    finally:
+        manager.control("stop", config.name)
+
+
+def test_droid_doctor_reports_computer_and_version_drift(manager, source, tmp_path, monkeypatch):
+    import os
+    import sys
+
+    binary_dir = tmp_path / "bin"
+    binary_dir.mkdir()
+    executable = binary_dir / "droid"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys, time\n"
+        "if sys.argv[1:2] == ['--version']:\n"
+        "    print('0.241.1')\n"
+        "elif sys.argv[1:3] == ['computer', 'list']:\n"
+        "    print('agent-fleet\\tuuid-1234 (this machine)')\n"
+        "elif sys.argv[1:2] == ['doctor']:\n"
+        "    print(json.dumps({'results': [{'id': 'daemon.loopback', 'status': 'pass'}]}))\n"
+        "else:\n"
+        "    print('[droid daemon] Daemon is running', flush=True)\n"
+        "    print('  Version: 0.240.0', flush=True)\n"
+        "    print('  Relay: wss://relay.factory.ai/v0/computer/uuid-1234/agent "
+        "(Computer: agent-fleet, ID: uuid-1234)', flush=True)\n"
+        "    while True: time.sleep(0.1)\n"
+    )
+    executable.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{binary_dir}:{os.environ['PATH']}")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    config = planned_droid(manager, source)
+    manager.setup(config)
+    try:
+        manager.control("start", config.name)
+        checks = manager.doctor(config.name)
+        details = "\n".join(detail for _, _, detail in checks)
+        assert "Registered Factory Computer: agent-fleet (uuid-1234)" in details
+        assert "Running daemon is v0.240.0 while installed Droid CLI is v0.241.1" in details
+    finally:
+        manager.control("stop", config.name)
+
+
+def test_droid_multi_project_directories_and_transition(manager, tmp_path):
+    first = tmp_path / "proj-a"
+    second = tmp_path / "proj-b"
+    third = tmp_path / "proj-c"
+    for directory in (first, second, third):
+        directory.mkdir()
+    config = make_instance(
+        manager.store,
+        name="droid-multi",
+        provider="droid",
+        project_dirs=[str(first), str(second)],
+        backend="process",
+    )
+    manager.setup(config)
+    worker_dir = config.worker_dir(manager.store.location(config.name), 1)
+    assert (worker_dir / "projects/proj-a").resolve() == first.resolve()
+    assert (worker_dir / "projects/proj-b").resolve() == second.resolve()
+    assert len(manager.list_dirs(config.name)) == 2
+
+    manager.add_dirs(config.name, [str(third)])
+    assert len(manager.list_dirs(config.name)) == 3
+    assert (worker_dir / "projects/proj-c").resolve() == third.resolve()
+
+    manager.remove_dirs(config.name, [str(second)])
+    assert len(manager.list_dirs(config.name)) == 2
+    assert not (worker_dir / "projects/proj-b").exists()
+    assert second.is_dir()
+    manager.remove(config.name)
+    assert first.is_dir() and third.is_dir()

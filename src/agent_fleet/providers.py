@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import urllib.error
@@ -13,9 +14,15 @@ from agent_fleet.model import FleetError, Instance, gpu_group
 
 GUIDANCE = {
     "cursor": "Install Cursor CLI, then run cursor-agent login. Dispatch via Cursor → My Machines.",
-    "devin": "Install Devin CLI. Create an Outpost and token in Devin Cloud → Settings → Outposts.",
+    "devin": (
+        "Install and log in to Devin CLI, then attach one Outpost worker "
+        "to your existing project directories."
+    ),
     "amp": "Install Amp CLI and run amp login. Dispatch via Amp → Runner → directory.",
-    "droid": "Install Droid CLI and run droid /login. Dispatch via Factory → Droid Computers.",
+    "droid": (
+        "Install Droid CLI, run droid /login, and register with droid computer register. "
+        "Dispatch via Factory → Droid Computers."
+    ),
 }
 
 
@@ -70,7 +77,7 @@ def gpu_count() -> int:
 @dataclass
 class Command:
     argv: list[str] = field(repr=False)
-    env: dict[str, str]
+    env: dict[str, str] = field(repr=False)
     cwd: Path
 
 
@@ -114,7 +121,7 @@ def build_command(
         env["DEVIN_WORKDIR"] = str(directory)
         args = [executable, "worker", "start", f"--outpost={config.outpost_name}"]
         if secret:
-            args.append(f"--token={secret}")
+            env["DEVIN_OUTPOSTS_TOKEN"] = secret
     elif config.provider == "amp":
         args = [executable, "--no-tui", "--runner-id", config.runner_id, "--no-serve-cwd"]
         # Managed checkouts are startup flags; extra directories are applied with
@@ -129,8 +136,105 @@ def build_command(
             for pattern in config.discover_excludes:
                 args += ["--discover-exclude", pattern]
     else:
-        args = [executable, "daemon", "--remote-access"]
+        args = [executable, "daemon", "--remote-control"]
     return Command(args, env, directory)
+
+
+_DROID_RELAY_RE = re.compile(r"\(Computer:\s*([^,)\r\n]+),\s*ID:\s*([^)\r\n]+)\)")
+_DROID_VERSION_RE = re.compile(r"^\s*Version:\s*(\S+)\s*$")
+
+
+def droid_log_info(logfile: Path | None) -> dict[str, str]:
+    """Inspect a Droid worker log for readiness, errors, computer identity and version."""
+    info = {"state": "unknown", "error": "", "name": "", "id": "", "version": ""}
+    if logfile is None or logfile.is_symlink() or not logfile.is_file():
+        return info
+    try:
+        lines = logfile.read_text(errors="replace").splitlines()
+    except OSError:
+        return info
+    for line in lines:
+        if match := _DROID_RELAY_RE.search(line):
+            info["name"], info["id"] = match.group(1).strip(), match.group(2).strip()
+    start_idx = 0
+    for idx, line in enumerate(lines):
+        if "Starting droid-" in line or (
+            "Starting " in line and "Remote task availability" in line
+        ):
+            start_idx = idx + 1
+    current = lines[start_idx:] if start_idx else lines
+    info["state"] = "starting"
+    for line in current:
+        text = line.split("  ", 1)[-1].strip() if "  " in line else line.strip()
+        if match := _DROID_VERSION_RE.match(text):
+            info["version"] = match.group(1)
+        if "[droid daemon] Daemon is running" in text or "Relay: wss://" in text:
+            info["state"] = "ready"
+        elif text.startswith("Startup failed:"):
+            info["state"] = "failed"
+            info["error"] = text.removeprefix("Startup failed:").strip()
+        elif "requires a registered computer" in text and not info["error"]:
+            info["state"] = "failed"
+            info["error"] = text
+        elif text.startswith("Worker exited (code ") and info["state"] != "ready":
+            info["state"] = "failed"
+    return info
+
+
+def droid_registration(
+    logfile: Path | None = None, *, probe_cli: bool = False
+) -> dict[str, str] | None:
+    """Return Factory Remote Control registration metadata when available."""
+    log = droid_log_info(logfile)
+    computer_id = log["id"]
+    computer_name = log["name"]
+    factory_dir = Path.home() / ".factory"
+    for filename, key_path in (
+        ("computer.json", ("computerId",)),
+        ("host.json", ("computerRegistration", "computerId")),
+    ):
+        candidate = factory_dir / filename
+        if not candidate.is_symlink() and candidate.is_file():
+            try:
+                node = json.loads(candidate.read_text(errors="replace"))
+                for part in key_path:
+                    node = node.get(part) if isinstance(node, dict) else None
+                if isinstance(node, str) and node.strip():
+                    computer_id = node.strip()
+                    break
+            except (OSError, ValueError, TypeError):
+                pass
+    if probe_cli:
+        try:
+            listing = run([binary("droid"), "computer", "list"], timeout=5)
+            for line in listing.splitlines():
+                if "(this machine)" in line:
+                    cleaned = line.replace("(this machine)", "").strip()
+                    parts = cleaned.split()
+                    if len(parts) >= 2:
+                        computer_name = parts[0].strip()
+                        computer_id = parts[1].strip()
+                    elif parts:
+                        computer_name = parts[0].strip()
+                    break
+        except FleetError:
+            pass
+    if not computer_id and not computer_name:
+        return None
+    return {
+        "id": computer_id,
+        "name": computer_name,
+        "version": log["version"],
+    }
+
+
+def droid_cli_version() -> str | None:
+    try:
+        output = run([binary("droid"), "--version"], timeout=3)
+    except FleetError:
+        return None
+    first = output.splitlines()[0].strip() if output else ""
+    return first.removeprefix("v") if first else None
 
 
 def amp_runner(config: Instance) -> dict | None:
@@ -163,7 +267,7 @@ def amp_dirs_command(config: Instance, verb: str, paths: list[str]) -> list[str]
     return [binary("amp"), "runner", "dirs", verb, "--runner-id", config.runner_id, *paths]
 
 
-def readiness(config: Instance, index: int) -> str:
+def readiness(config: Instance, index: int, logfile: Path | None = None) -> str:
     """Return readiness evidence, never infer remote availability from a live PID."""
     try:
         if config.provider == "cursor":
@@ -176,6 +280,9 @@ def readiness(config: Instance, index: int) -> str:
         if config.provider == "amp":
             return "local ready" if amp_runner(config) is not None else "starting"
         if config.provider == "droid":
+            log = droid_log_info(logfile)
+            if log["state"] == "failed":
+                return "starting"
             data = json.loads(
                 run(
                     [
@@ -189,14 +296,15 @@ def readiness(config: Instance, index: int) -> str:
                     timeout=5,
                 )
             )
-            return (
-                "local ready"
-                if any(
-                    x.get("id") == "daemon.loopback" and x.get("status") == "pass"
-                    for x in data.get("results", [])
-                )
-                else "starting"
+            loopback_ok = any(
+                x.get("id") == "daemon.loopback" and x.get("status") == "pass"
+                for x in data.get("results", [])
             )
+            if not loopback_ok:
+                return "starting"
+            if logfile is not None and logfile.is_file() and log["state"] != "ready":
+                return "starting"
+            return "local ready"
         return "unverified"
     except (FleetError, ValueError, TypeError, AttributeError, urllib.error.URLError, OSError):
         return "starting"

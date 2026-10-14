@@ -92,6 +92,10 @@ def setup(
     backend: str = "auto",
     outpost: str = "",
     gpu_split: bool = False,
+    project_dir: Annotated[
+        list[str],
+        typer.Option("--project-dir", help="Devin/Droid: existing project directory."),
+    ] = (),
     extra_dir: Annotated[
         list[str], typer.Option("--extra-dir", help="Amp: also serve this directory.")
     ] = (),
@@ -115,7 +119,17 @@ def setup(
         else:
             dashboard(manager, setup=True)
         return
-    if not source:
+    if provider == "devin":
+        if source:
+            raise FleetError("Devin uses --project-dir, not a single --source.")
+        if not project_dir:
+            raise FleetError("Provide at least one --project-dir for Devin.")
+    elif provider == "droid":
+        if source and project_dir:
+            raise FleetError("Droid uses either --source or --project-dir, not both.")
+        if not source and not project_dir:
+            raise FleetError("Provide --source or --project-dir for Droid.")
+    elif not source:
         raise FleetError("Provide --source with a Git URL or existing local directory.")
     config = make_instance(
         manager.store,
@@ -127,6 +141,7 @@ def setup(
         backend=backend,
         outpost=outpost,
         gpu_split=gpu_split,
+        project_dirs=project_dir,
         extra_dirs=extra_dir,
         discover_dirs=discover,
         discover_depth=discover_depth or 0,
@@ -135,7 +150,12 @@ def setup(
     )
     secret = ""
     if provider == "devin" and not manager.dry_run:
-        secret = typer.prompt("Devin Outpost token", hide_input=True)
+        secret = typer.prompt(
+            "Devin Outpost token (press Enter to use Devin CLI login)",
+            hide_input=True,
+            default="",
+            show_default=False,
+        )
     output(manager.setup(config, secret=secret), preview=manager.dry_run)
 
 
@@ -217,7 +237,7 @@ def add(ctx: typer.Context, count: Annotated[int, typer.Argument(min=1, max=128)
 
 
 dirs_app = typer.Typer(
-    help="Manage the directories an Amp runner serves.",
+    help="Manage Devin/Droid project directories and Amp served directories.",
     no_args_is_help=False,
 )
 app.add_typer(dirs_app, name="dirs")
@@ -225,11 +245,17 @@ app.add_typer(dirs_app, name="dirs")
 
 @dirs_app.callback(invoke_without_command=True)
 def dirs_root(ctx: typer.Context) -> None:
-    """List served directories. Run without a subcommand to list them."""
+    """List project or served directories."""
     manager, selected = ctx.obj
     if ctx.invoked_subcommand is not None:
         return
-    table = Table(title="Amp directories", border_style="blue")
+    config = manager.store.select(selected)
+    title = (
+        f"{config.provider.capitalize()} projects"
+        if config.provider in ("devin", "droid")
+        else "Amp directories"
+    )
+    table = Table(title=title, border_style="blue")
     for column in ("Kind", "Served", "Path"):
         table.add_column(column)
     for row in manager.list_dirs(selected):
@@ -243,7 +269,7 @@ def dirs_add(
     ctx: typer.Context,
     paths: Annotated[list[str], typer.Argument(help="Absolute directories to serve.")],
 ) -> None:
-    """Serve extra directories, on a running runner immediately."""
+    """Link Devin projects or serve extra Amp directories."""
     manager, selected = ctx.obj
     output(manager.add_dirs(selected, paths), preview=manager.dry_run)
 
@@ -253,7 +279,7 @@ def dirs_remove(
     ctx: typer.Context,
     paths: Annotated[list[str], typer.Argument(help="Configured directories to stop serving.")],
 ) -> None:
-    """Stop serving extra directories or discovery roots."""
+    """Unlink Devin projects or stop serving Amp directories."""
     manager, selected = ctx.obj
     output(manager.remove_dirs(selected, paths), preview=manager.dry_run)
 

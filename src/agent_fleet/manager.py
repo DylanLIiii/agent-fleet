@@ -30,6 +30,9 @@ from agent_fleet.providers import (
     amp_dirs_command,
     amp_served_dirs,
     binary,
+    droid_cli_version,
+    droid_log_info,
+    droid_registration,
     gpu_count,
     readiness,
     run,
@@ -43,12 +46,13 @@ def make_instance(
     *,
     name: str,
     provider: str,
-    source: str,
+    source: str = "",
     count: int = 4,
     label: str = "",
     backend: str = "auto",
     outpost: str = "",
     gpu_split: bool = False,
+    project_dirs: Sequence[str] = (),
     extra_dirs: Sequence[str] = (),
     discover_dirs: Sequence[str] = (),
     discover_depth: int = 0,
@@ -57,18 +61,50 @@ def make_instance(
 ) -> Instance:
     if backend not in ("auto", "process", "systemd"):
         raise FleetError("Choose auto, process or systemd as the backend.")
-    if provider == "droid":
+    if provider == "devin":
+        if source:
+            raise FleetError("Devin uses existing project directories, not a single Git source.")
+        if not project_dirs:
+            raise FleetError("Add at least one existing project directory for Devin.")
+        if any(not Path(path).name for path in project_dirs):
+            raise FleetError("A Devin project directory cannot be the filesystem root.")
         count = 1
-        if "://" in source or re.fullmatch(r"[^/\s:]+@[^/\s:]+:.+", source):
-            repo_url = source
-            repo_name = source.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
-            repo_name = repo_name.rsplit(":", 1)[-1]
-            droid_dir = str(store.home / "instances" / name / "checkouts" / f"{repo_name}-w1")
+        repo_url, repo_name, droid_dir = "", "projects", ""
+        projects = local_dirs("Project directories", project_dirs)
+    elif provider == "droid":
+        count = 1
+        if project_dirs:
+            if source:
+                raise FleetError(
+                    "Droid uses existing project directories, not a single Git source."
+                )
+            if any(not Path(path).name for path in project_dirs):
+                raise FleetError("A Droid project directory cannot be the filesystem root.")
+            repo_url = ""
+            repo_name = "projects"
+            droid_dir = str(store.home / "instances" / name / "droid-workers" / "w1")
+            projects = local_dirs("Project directories", project_dirs)
         else:
-            repo_url, droid_dir = "", str(Path(source).expanduser())
-            repo_name = Path(droid_dir).name
+            if not source:
+                raise FleetError(
+                    "Provide a Git URL, existing local directory, or project directories."
+                )
+            if "://" in source or re.fullmatch(r"[^/\s:]+@[^/\s:]+:.+", source):
+                repo_url = source
+                repo_name = source.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
+                repo_name = repo_name.rsplit(":", 1)[-1]
+                droid_dir = str(store.home / "instances" / name / "checkouts" / f"{repo_name}-w1")
+            else:
+                repo_url, droid_dir = "", str(Path(source).expanduser())
+                repo_name = Path(droid_dir).name
+            projects = ()
     else:
+        if project_dirs:
+            raise FleetError("Project directories are only supported for Devin and Droid.")
+        if not source:
+            raise FleetError("Provide a Git URL or existing local directory.")
         droid_dir = ""
+        projects = ()
         local = Path(source).expanduser()
         repo_url = source
         if local.is_dir():
@@ -95,6 +131,7 @@ def make_instance(
         outpost_name=outpost,
         gpu_split=gpu_split,
         use_systemd=systemd,
+        project_dirs=projects,
         extra_dirs=local_dirs("Extra directories", extra_dirs),
         discover_dirs=local_dirs("Discovery roots", discover_dirs),
         discover_depth=discover_depth,
@@ -262,7 +299,7 @@ class Manager:
         def evidence(config: Instance, index: int) -> str:
             if not self.running(config, index):
                 return self._legacy_state(config, index) or "stopped"
-            return readiness(config, index) if probe else "running"
+            return readiness(config, index, self.paths(config, index)[1]) if probe else "running"
 
         # Slow provider probes must not serialize hundreds of independent workers.
         with ThreadPoolExecutor(max_workers=8) as pool:
@@ -288,6 +325,14 @@ class Manager:
                     )
         return result
 
+    def droid_identity(self, config: Instance) -> str:
+        reg = droid_registration(self.paths(config, 1)[1], probe_cli=False)
+        if reg and reg["name"] and reg["name"] != config.runner_id:
+            return f"{reg['name']} ({config.runner_id})"
+        if reg and reg["name"]:
+            return reg["name"]
+        return config.runner_id
+
     def _assert_repo(self, config: Instance, path: Path) -> None:
         safe_path(path / ".git")
         if not (path / ".git").is_dir():
@@ -298,6 +343,8 @@ class Manager:
     def _prepare(self, config: Instance) -> list[str]:
         home = self.store.location(config.name)
         actions = []
+        if config.provider in ("devin", "droid") and config.project_dirs:
+            return self._prepare_project_links(config, home)
         if config.provider == "droid" and not config.repo_url:
             return [f"Use existing directory {config.droid_dir}; never clone or delete it."]
         if config.provider == "droid":
@@ -358,6 +405,97 @@ class Manager:
                     shutil.rmtree(temporary)
         return actions
 
+    def _prepare_project_links(self, config: Instance, home: Path) -> list[str]:
+        label = config.provider.capitalize()
+        worker_dir = config.worker_dir(home, 1)
+        safe_path(worker_dir)
+        links = worker_dir / "projects"
+        safe_path(links)
+        actions = []
+        for source in config.project_dirs:
+            project = Path(source)
+            safe_path(project)
+            if not project.is_dir():
+                raise FleetError(f"Configured {label} project directory is missing: {project}")
+            if project == home.resolve() or project.is_relative_to(home.resolve()):
+                raise FleetError(
+                    f"{label} project directories cannot be inside Agent Fleet's home: {project}"
+                )
+            link = links / project.name
+            if link.is_symlink():
+                if link.resolve() != project:
+                    raise FleetError(
+                        f"Refusing to replace a project link that points elsewhere: {link}"
+                    )
+                actions.append(f"Keep project link {link} → {project}")
+            elif link.exists():
+                raise FleetError(f"Refusing to replace existing project path: {link}")
+            else:
+                actions.append(f"Link existing project {project} → {link}")
+        if not self.dry_run:
+            worker_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            links.mkdir(parents=True, exist_ok=True, mode=0o700)
+            for source in config.project_dirs:
+                project = Path(source)
+                link = links / project.name
+                if not link.exists() and not link.is_symlink():
+                    link.symlink_to(project, target_is_directory=True)
+        return actions
+
+    def _assert_project_links(self, config: Instance, home: Path) -> None:
+        label = config.provider.capitalize()
+        worker_dir = config.worker_dir(home, 1)
+        safe_path(worker_dir)
+        links = worker_dir / "projects"
+        safe_path(links)
+        for source in config.project_dirs:
+            project = Path(source)
+            safe_path(project)
+            if not project.is_dir():
+                raise FleetError(f"Configured {label} project directory is missing: {project}")
+            link = links / project.name
+            if not link.is_symlink() or link.resolve() != project:
+                raise FleetError(
+                    f"{label} project link is missing or changed: {link}. Run repair to restore it."
+                )
+
+    def _instance_directories(self, config: Instance, index: int) -> tuple[Path, ...]:
+        if config.provider in ("devin", "droid") and config.project_dirs:
+            return tuple(Path(path) for path in config.project_dirs)
+        if config.provider == "droid":
+            return (Path(config.droid_dir),)
+        home = self.store.location(config.name)
+        if config.provider == "amp":
+            return (
+                *(config.worker_dir(home, worker) for worker in config.active_workers),
+                *(Path(path) for path in config.extra_dirs),
+                *(Path(path) for path in config.discover_dirs),
+            )
+        return (config.repo_dir(home, index),)
+
+    def _assert_no_active_directory_conflicts(self, config: Instance, index: int) -> None:
+        current = tuple(path.resolve() for path in self._instance_directories(config, index))
+        for other in self.store.all():
+            if other.name == config.name:
+                continue
+            for other_index in other.process_indices():
+                if not self.running(other, other_index):
+                    continue
+                active = tuple(
+                    path.resolve() for path in self._instance_directories(other, other_index)
+                )
+                for path in current:
+                    if any(
+                        path == active_path
+                        or path.is_relative_to(active_path)
+                        or active_path.is_relative_to(path)
+                        for active_path in active
+                    ):
+                        raise FleetError(
+                            f"Directory {path} overlaps active instance '{other.name}'. "
+                            "Stop the other worker before sharing project files."
+                        )
+
     def setup(self, config: Instance, *, secret: str = "") -> list[str]:
         config.validate()
         with self.store.lock(self.dry_run):
@@ -368,12 +506,12 @@ class Manager:
                 )
             if config.provider == "droid" and any(x.provider == "droid" for x in self.store.all()):
                 raise FleetError("Only one Droid Computer can be registered per machine.")
-            if config.provider == "devin" and not secret and not self.dry_run:
-                raise FleetError("Enter your Devin Outpost token.")
             if secret and config.provider not in ("cursor", "devin"):
                 raise FleetError("This provider uses its CLI login, not a Fleet credential.")
             if secret and ("\n" in secret or "\r" in secret):
                 raise FleetError("Credential must be a nonempty single line.")
+            if config.provider in ("devin", "droid") and config.project_dirs:
+                self._assert_no_active_directory_conflicts(config, 1)
             actions = self._prepare(config)
             if self.clone_cancel is not None and self.clone_cancel.is_set():
                 raise CloneError("Git clone cancelled. No instance configuration was saved.")
@@ -393,6 +531,10 @@ class Manager:
             config = self.store.select(name)
             if config.provider == "droid":
                 raise FleetError("Droid supports one Computer per machine, not multiple workers.")
+            if config.provider == "devin":
+                raise FleetError(
+                    "Devin uses one queue worker per instance; add project directories instead."
+                )
             if count < 1 or config.worker_count + count > 128:
                 raise FleetError("Add a positive number of workers, up to 128 total.")
             if config.shared or config.gpu_split:
@@ -413,15 +555,36 @@ class Manager:
                 self.store.save(updated)
             return actions + [f"Added {count} worker(s). Start them when you are ready."]
 
-    def _amp_config(self, name: str | None) -> Instance:
+    def _dirs_config(self, name: str | None) -> Instance:
         config = self.store.select(name)
-        if config.provider != "amp":
-            raise FleetError("Only Amp instances manage extra directories.")
+        if config.provider not in ("amp", "devin", "droid"):
+            raise FleetError("Only Devin, Amp and Droid instances manage multiple directories.")
+        if config.provider == "devin" and not config.project_dirs:
+            raise FleetError("This legacy Devin instance must be converted to project directories.")
+        if config.provider == "droid" and config.repo_url:
+            raise FleetError(
+                "This Droid instance uses a managed Git clone. "
+                "Create a Droid instance with --project-dir to link multiple directories."
+            )
         self._require_managed_targets(config)
         return config
 
     def list_dirs(self, name: str | None) -> list[DirStatus]:
-        config = self._amp_config(name)
+        config = self._dirs_config(name)
+        if config.provider in ("devin", "droid"):
+            if config.provider == "droid" and not config.project_dirs:
+                target = Path(config.droid_dir)
+                return [DirStatus(config.name, config.droid_dir, "project", target.is_dir())]
+            home = self.store.location(config.name)
+            worker_dir = config.worker_dir(home, 1)
+            links = worker_dir / "projects"
+            rows = []
+            for path in config.project_dirs:
+                project = Path(path)
+                link = links / project.name
+                live = project.is_dir() and link.is_symlink() and link.resolve() == project
+                rows.append(DirStatus(config.name, path, "project", live))
+            return rows
         home = self.store.location(config.name)
         live = amp_served_dirs(config)
         served = set(live) if live is not None else None
@@ -459,17 +622,55 @@ class Manager:
 
     def add_dirs(self, name: str | None, paths: list[str]) -> list[str]:
         with self.store.lock(self.dry_run):
-            config = self._amp_config(name)
-            added = local_dirs("Extra directories", paths)
+            config = self._dirs_config(name)
+            is_project = config.provider in ("devin", "droid")
+            label = "Project directories" if is_project else "Extra directories"
+            added = local_dirs(label, paths)
             if not added:
                 raise FleetError("Enter at least one directory.")
-            new = tuple(path for path in added if path not in config.extra_dirs)
+            base_projects = config.project_dirs
+            droid_dir = config.droid_dir
+            repo_name = config.repo_name
+            if config.provider == "droid" and not base_projects:
+                base_projects = local_dirs("Project directories", (config.droid_dir,))
+                droid_dir = str(self.store.location(config.name) / "droid-workers" / "w1")
+                repo_name = "projects"
+            configured = base_projects if is_project else config.extra_dirs
+            new = tuple(path for path in added if path not in configured)
             if not new:
                 raise FleetError("Those directories are already configured.")
-            updated = replace(config, extra_dirs=config.extra_dirs + new)
+            if is_project and any(not Path(path).name for path in new):
+                raise FleetError(
+                    f"A {config.provider.capitalize()} project directory "
+                    "cannot be the filesystem root."
+                )
+            updated = replace(
+                config,
+                repo_name=repo_name,
+                droid_dir=droid_dir,
+                project_dirs=base_projects + new if is_project else config.project_dirs,
+                extra_dirs=config.extra_dirs + new
+                if config.provider == "amp"
+                else config.extra_dirs,
+            )
             updated.validate()
             if self.dry_run:
-                return [f"Would serve {path}." for path in new]
+                return [
+                    f"Would link project directory {path}."
+                    if is_project
+                    else f"Would serve {path}."
+                    for path in new
+                ]
+            if is_project:
+                if any(self.running(config, index) for index in config.process_indices()):
+                    raise FleetError(
+                        f"Stop the {config.provider.capitalize()} worker "
+                        "before changing its project directories."
+                    )
+                self._assert_no_active_directory_conflicts(updated, 1)
+                messages = self._prepare_project_links(updated, self.store.location(config.name))
+                self.store.save(updated)
+                return messages
             live = self.running(config, config.active_workers[0])
             # Apply to the running runner first: a rejected directory stays unconfigured.
             if live:
@@ -483,7 +684,13 @@ class Manager:
 
     def remove_dirs(self, name: str | None, paths: list[str]) -> list[str]:
         with self.store.lock(self.dry_run):
-            config = self._amp_config(name)
+            config = self._dirs_config(name)
+            is_project = config.provider in ("devin", "droid")
+            if config.provider == "droid" and not config.project_dirs:
+                raise FleetError(
+                    "A Droid instance needs at least one project directory. "
+                    "Use remove to unregister the whole instance."
+                )
             wanted = []
             for value in paths:
                 text = str(value).strip()
@@ -494,13 +701,54 @@ class Manager:
                     wanted.append(resolved)
             if not wanted:
                 raise FleetError("Enter at least one directory.")
-            unknown = [
-                path
-                for path in wanted
-                if path not in config.extra_dirs and path not in config.discover_dirs
-            ]
+            configured = (config.project_dirs if is_project else config.extra_dirs) + (
+                () if is_project else config.discover_dirs
+            )
+            unknown = [path for path in wanted if path not in configured]
             if unknown:
                 raise FleetError(f"Not a configured directory: {unknown[0]}")
+            if is_project:
+                provider_label = config.provider.capitalize()
+                home = self.store.location(config.name)
+                if any(self.running(config, index) for index in config.process_indices()):
+                    raise FleetError(
+                        f"Stop the {provider_label} worker before changing its project directories."
+                    )
+                links = config.worker_dir(home, 1) / "projects"
+                self._assert_project_links(config, home)
+                for source in wanted:
+                    project = Path(source)
+                    safe_path(links)
+                    link = links / project.name
+                    if link.is_symlink() and link.resolve() != project:
+                        raise FleetError(
+                            f"Refusing to remove a project link that points elsewhere: {link}"
+                        )
+                    if link.exists() and not link.is_symlink():
+                        raise FleetError(f"Refusing to remove an unmanaged project path: {link}")
+                    if not link.is_symlink():
+                        raise FleetError(
+                            f"{provider_label} project link is missing: {link}. Run repair first."
+                        )
+                updated = replace(
+                    config,
+                    project_dirs=tuple(path for path in config.project_dirs if path not in wanted),
+                )
+                if not updated.project_dirs:
+                    raise FleetError(
+                        f"A {provider_label} instance needs at least one project directory. "
+                        "Use remove to unregister the whole instance."
+                    )
+                if self.dry_run:
+                    return [f"Would unlink project directory {path}." for path in wanted]
+                for source in wanted:
+                    link = links / Path(source).name
+                    if link.is_symlink():
+                        link.unlink()
+                self.store.save(updated)
+                return [
+                    f"Unlinked project directory {path}; source files were kept." for path in wanted
+                ]
             extras = [path for path in wanted if path in config.extra_dirs]
             roots = [path for path in wanted if path in config.discover_dirs]
             remaining = tuple(path for path in config.discover_dirs if path not in roots)
@@ -542,7 +790,10 @@ class Manager:
     ) -> list[str]:
         """Set Amp directory discovery. ``depth=None`` keeps the configured depth."""
         with self.store.lock(self.dry_run):
-            config = self._amp_config(name)
+            config = self.store.select(name)
+            if config.provider != "amp":
+                raise FleetError("Directory discovery is only supported for Amp.")
+            self._require_managed_targets(config)
             if clear:
                 found, patterns, levels = (), (), 0
             else:
@@ -636,13 +887,14 @@ class Manager:
             backend = "systemd" if config.use_systemd else "process"
             return f"Would start {config.key(index)} using {backend}."
         binary(config.provider)
-        if config.provider == "droid" and not Path(config.droid_dir).is_dir():
+        self._assert_no_active_directory_conflicts(config, index)
+        if config.provider in ("devin", "droid") and config.project_dirs:
+            self._assert_project_links(config, home)
+        elif config.provider == "droid" and not Path(config.droid_dir).is_dir():
             raise FleetError("Droid working directory is missing. Run repair before starting.")
-        if config.provider != "droid" or config.repo_url:
+        elif config.provider != "droid" or config.repo_url:
             for worker in config.active_workers if config.shared else (index,):
                 self._assert_repo(config, config.repo_dir(home, worker))
-        if config.provider == "devin" and not self.store.secret(config):
-            raise FleetError("Missing Devin token. Use 'agent-fleet credential' to save one.")
         pidfile, logfile, unit = self.paths(config, index)
         if config.use_systemd:
             if unit.exists() or unit.is_symlink():
@@ -701,10 +953,20 @@ class Manager:
             time.sleep(min(0.3, self.ready_timeout))
             while time.monotonic() < deadline:
                 if not self.running(config, index):
-                    raise FleetError("Worker exited during startup. Check its logs.")
-                evidence = readiness(config, index)
+                    detail = droid_log_info(logfile)["error"] if config.provider == "droid" else ""
+                    raise FleetError(
+                        f"Worker exited during startup: {detail}"
+                        if detail
+                        else "Worker exited during startup. Check its logs."
+                    )
+                evidence = readiness(config, index, logfile)
                 if not self.running(config, index):
-                    raise FleetError("Worker exited during its readiness probe. Check logs.")
+                    detail = droid_log_info(logfile)["error"] if config.provider == "droid" else ""
+                    raise FleetError(
+                        f"Worker exited during its readiness probe: {detail}"
+                        if detail
+                        else "Worker exited during its readiness probe. Check logs."
+                    )
                 if evidence in ("ready", "local ready", "unverified"):
                     # Devin has no readiness probe; require a brief stable process lifetime.
                     if evidence == "unverified":
@@ -824,6 +1086,8 @@ class Manager:
             return "".join(deque(stream, maxlen=lines)).rstrip()
 
     def assert_deletable(self, config: Instance, index: int) -> Path:
+        if config.provider == "devin" and config.project_dirs:
+            raise FleetError("Existing Devin project directories are never deleted.")
         home = self.store.location(config.name)
         directory = config.repo_dir(home, index)
         if config.provider == "droid":
@@ -863,6 +1127,22 @@ class Manager:
             config = self.store.select(name)
             self._require_managed_targets(config, target)
             targets = config.targets(target)
+            if delete_checkouts and config.provider in ("devin", "droid") and config.project_dirs:
+                raise FleetError(
+                    f"Existing {config.provider.capitalize()} project directories "
+                    "are never deleted."
+                )
+            if config.provider in ("devin", "droid") and config.project_dirs:
+                home = self.store.location(config.name)
+                links = config.worker_dir(home, 1) / "projects"
+                self._assert_project_links(config, home)
+                for source in config.project_dirs:
+                    link = links / Path(source).name
+                    if not link.is_symlink() or link.resolve() != Path(source):
+                        raise FleetError(
+                            f"{config.provider.capitalize()} project link is missing or changed: "
+                            f"{link}; refusing to remove the instance."
+                        )
             if delete_checkouts and config.provider != "droid":
                 for index in targets:
                     self.assert_deletable(config, index)
@@ -877,6 +1157,10 @@ class Manager:
                         shutil.rmtree(directory)
             remaining = tuple(i for i in config.active_workers if i not in targets)
             if not self.dry_run:
+                if config.provider in ("devin", "droid") and config.project_dirs:
+                    links = config.worker_dir(home, 1) / "projects"
+                    for source in config.project_dirs:
+                        (links / Path(source).name).unlink()
                 if remaining:
                     self.store.save(replace(config, active_workers=remaining))
                 else:
@@ -904,23 +1188,68 @@ class Manager:
                 checks.append(("fail", config.name, str(exc)))
             for index in config.active_workers:
                 try:
-                    if config.provider != "droid" or config.repo_url:
+                    if config.provider in ("devin", "droid") and config.project_dirs:
+                        self._assert_project_links(config, self.store.location(config.name))
+                    elif config.provider != "droid" or config.repo_url:
                         self._assert_repo(
                             config, config.repo_dir(self.store.location(config.name), index)
                         )
+                    elif not Path(config.droid_dir).is_dir():
+                        raise FleetError(f"Droid working directory is missing: {config.droid_dir}")
                     checks.append(("pass", f"{config.name} / {index}", "Workspace verified."))
                 except FleetError as exc:
                     checks.append(("fail", f"{config.name} / {index}", str(exc)))
             if config.provider == "devin":
                 checks.append(
                     (
-                        "pass" if self.store.secret(config) else "fail",
+                        "pass" if self.store.secret(config) else "info",
                         config.name,
                         "Devin token is saved."
                         if self.store.secret(config)
-                        else "Devin token is missing.",
+                        else (
+                            "Using Devin CLI login if available; otherwise sign in or "
+                            "save an Outpost token."
+                        ),
                     )
                 )
+            elif config.provider == "droid":
+                reg = droid_registration(self.paths(config, 1)[1], probe_cli=True)
+                if reg:
+                    target = (
+                        f"{reg['name']} ({reg['id']})"
+                        if reg["name"] and reg["id"]
+                        else reg["name"] or reg["id"]
+                    )
+                    checks.append(("pass", config.name, f"Registered Factory Computer: {target}."))
+                    cli_ver = droid_cli_version()
+                    daemon_ver = reg["version"].removeprefix("v")
+                    if self.running(config, 1) and cli_ver and daemon_ver:
+                        if cli_ver != daemon_ver:
+                            checks.append(
+                                (
+                                    "info",
+                                    config.name,
+                                    f"Running daemon is v{daemon_ver} while installed Droid CLI "
+                                    f"is v{cli_ver}. Restart to upgrade.",
+                                )
+                            )
+                        else:
+                            checks.append(
+                                (
+                                    "pass",
+                                    config.name,
+                                    f"Running daemon matches installed Droid CLI (v{cli_ver}).",
+                                )
+                            )
+                else:
+                    checks.append(
+                        (
+                            "info",
+                            config.name,
+                            "Computer is not registered yet; starting the worker runs "
+                            "droid computer register -y.",
+                        )
+                    )
             checks.append(
                 ("info", config.name, "A live process does not prove remote task availability.")
             )

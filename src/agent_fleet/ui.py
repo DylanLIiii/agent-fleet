@@ -43,8 +43,8 @@ Select an instance on the left and a worker in the table.
 Start, stop and restart affect the **selected worker**.
 Use the command line with `all` to control every worker in an instance.
 
-**Amp and Droid share one process.** A row action controls the entire runner.
-Amp serves several directories; Droid uses one existing directory.
+**Devin, Amp and Droid can share one process.** A row action controls that process.
+Devin links several existing projects, Amp serves directories, and Droid uses one directory.
 Amp also serves directories you add yourself (`e`) and Git checkouts it
 discovers under the roots you choose.
 
@@ -186,13 +186,17 @@ class RemoveScreen(ModalScreen[bool | None]):
                 f"{self.config.name} / worker {self.target}\n\n"
                 "The worker will stop and leave the fleet. Logs and data stay."
                 + (
-                    "\nAmp's shared runner will stop for all directories."
-                    if self.config.shared
+                    "\nThe shared Devin worker will stop; all linked projects are affected."
+                    if self.config.provider == "devin" and self.config.project_dirs
+                    else "\nAmp's shared runner will stop for all directories."
+                    if self.config.provider == "amp"
                     else ""
                 ),
                 markup=False,
             )
-            if self.config.provider != "droid":
+            if self.config.provider == "devin" and self.config.project_dirs:
+                yield Static("Existing Devin project directories are never deleted.")
+            elif self.config.provider != "droid":
                 yield Checkbox("Also delete its clean, Fleet-owned checkout", id="delete-checkout")
                 yield Static("Deletion is refused if any changed, ignored or unpushed work exists.")
             else:
@@ -217,7 +221,7 @@ class RemoveScreen(ModalScreen[bool | None]):
 
 
 class DirsScreen(ModalScreen[tuple[str, dict[str, Any]] | None]):
-    """Manage the directories an Amp runner serves, live when it runs."""
+    """Manage the project directories linked into Devin/Droid, or served by Amp."""
 
     BINDINGS = [("escape", "cancel", "Close")]
 
@@ -228,20 +232,38 @@ class DirsScreen(ModalScreen[tuple[str, dict[str, Any]] | None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dirs-dialog"):
-            yield Label(f"{self.config.name} · served directories", classes="dialog-title")
+            yield Label(
+                f"{self.config.name} · "
+                + (
+                    "project directories"
+                    if self.config.provider in ("devin", "droid")
+                    else "served directories"
+                ),
+                classes="dialog-title",
+            )
             yield Static(
-                "Directories you serve join a running runner at once. Discovery roots apply "
-                "when it starts. Directories added outside Agent Fleet are dropped at the "
-                "next start.",
+                (
+                    f"Existing project directories are linked into the "
+                    f"{self.config.provider.capitalize()} worker workspace. "
+                    "Stop the worker before changing directories; removing a link keeps its source."
+                    if self.config.provider in ("devin", "droid")
+                    else "Directories you serve join a running runner at once. Discovery roots "
+                    "apply when it starts. Directories added outside Agent Fleet are dropped at "
+                    "the next start."
+                ),
                 classes="muted",
             )
             yield DataTable(id="dir-list", cursor_type="row")
             yield Input(placeholder="/absolute/path", id="dir-path")
             with Horizontal(classes="dialog-actions"):
                 yield Button("Close", id="cancel")
-                yield Button("Remove selected", id="dir-remove")
-                yield Button("Discover here", id="dir-discover")
-                yield Button("Serve directory", id="dir-add", variant="primary")
+                if self.config.provider == "amp":
+                    yield Button("Remove selected", id="dir-remove")
+                    yield Button("Discover here", id="dir-discover")
+                    yield Button("Serve directory", id="dir-add", variant="primary")
+                else:
+                    yield Button("Unlink selected", id="dir-remove")
+                    yield Button("Link project", id="dir-add", variant="primary")
 
     def on_mount(self) -> None:
         table = self.query_one("#dir-list", DataTable)
@@ -358,6 +380,12 @@ class SetupScreen(ModalScreen[tuple[dict[str, Any], str, bool] | None]):
                         with Vertical():
                             yield Label("Discovery excludes (comma-separated)")
                             yield Input(placeholder="dotfiles, work/legacy", id="discover-exclude")
+                with Vertical(id="project-fields"):
+                    yield Label("Existing project directories (comma-separated)")
+                    yield Input(
+                        placeholder="/home/you/Jev-seen, /home/you/MiniCPM-V, /home/you/Vvbot",
+                        id="project-dirs",
+                    )
                 yield Checkbox("Split NVIDIA GPUs between workers", id="gpu-split")
                 with Vertical(id="outpost-fields"):
                     yield Label("Devin Outpost name")
@@ -400,25 +428,30 @@ class SetupScreen(ModalScreen[tuple[dict[str, Any], str, bool] | None]):
         self.query_one("#outpost-fields").display = provider == "devin"
         self.query_one("#credential-fields").display = provider in ("cursor", "devin")
         self.query_one("#dirs-fields").display = provider == "amp"
+        self.query_one("#project-fields").display = provider in ("devin", "droid")
         self.query_one("#credential-label", Label).update(
-            "Outpost token (required)"
+            "Outpost token (optional; Devin CLI login can create one)"
             if provider == "devin"
             else "API key (optional if CLI is logged in)"
         )
         self.query_one("#source-label", Label).update(
-            "Git URL to clone, or existing local directory (absolute path)"
+            "Git URL to clone, or existing local directory (optional if using project dirs)"
             if provider == "droid"
             else "Git URL or existing local Git directory"
         )
+        self.query_one("#source-label", Label).display = provider not in ("devin",)
+        self.query_one("#source", Input).display = provider not in ("devin",)
         self.query_one("#source", Input).placeholder = (
             "https://github.com/you/project.git or /path/to/project"
             if provider == "droid"
             else "git@github.com:you/project.git"
         )
-        self.query_one("#worker-count", Input).disabled = provider == "droid"
-        self.query_one("#worker-count", Input).value = "1" if provider == "droid" else "4"
-        self.query_one("#gpu-split", Checkbox).disabled = provider in ("amp", "droid")
-        if provider in ("amp", "droid"):
+        self.query_one("#worker-count", Input).disabled = provider in ("droid", "devin")
+        self.query_one("#worker-count", Input).value = (
+            "1" if provider in ("droid", "devin") else "4"
+        )
+        self.query_one("#gpu-split", Checkbox).disabled = provider in ("amp", "droid", "devin")
+        if provider in ("amp", "droid", "devin"):
             self.query_one("#gpu-split", Checkbox).value = False
 
     @on(Button.Pressed)
@@ -431,10 +464,8 @@ class SetupScreen(ModalScreen[tuple[dict[str, Any], str, bool] | None]):
             count = int(self.query_one("#worker-count", Input).value)
             if not 1 <= count <= 128:
                 raise FleetError("Use between 1 and 128 workers.")
-            source = self.query_one("#source", Input).value.strip()
-            if not source:
-                raise FleetError("Enter a repository or local directory.")
             provider = str(self.query_one("#provider", Select).value)
+            source = self.query_one("#source", Input).value.strip() if provider != "devin" else ""
             payload = {
                 "name": name,
                 "provider": provider,
@@ -447,6 +478,17 @@ class SetupScreen(ModalScreen[tuple[dict[str, Any], str, bool] | None]):
                 ),
                 "gpu_split": self.query_one("#gpu-split", Checkbox).value,
             }
+            if provider == "devin":
+                payload["project_dirs"] = split_values(self.query_one("#project-dirs", Input).value)
+                make_instance(self.app.manager.store, **payload, preview=True)
+            elif provider == "droid":
+                project_dirs = split_values(self.query_one("#project-dirs", Input).value)
+                if project_dirs:
+                    payload["project_dirs"] = project_dirs
+                elif not source:
+                    raise FleetError("Enter a repository, local directory, or project directories.")
+            elif not source:
+                raise FleetError("Enter a repository or local directory.")
             if provider == "amp":
                 depth = self.query_one("#discover-depth", Input).value.strip()
                 if depth and not depth.isdigit():
@@ -464,8 +506,6 @@ class SetupScreen(ModalScreen[tuple[dict[str, Any], str, bool] | None]):
                 make_instance(self.app.manager.store, **payload, preview=True)
             preview = self.query_one("#setup-preview", Checkbox).value
             secret = self.query_one("#secret", Input).value
-            if payload["provider"] == "devin" and not secret and not preview:
-                raise FleetError("Enter the Outpost token, or choose preview only.")
             if payload["provider"] not in ("cursor", "devin"):
                 secret = ""
             self.dismiss((payload, secret, preview))
@@ -803,10 +843,23 @@ class FleetApp(App):
                 "Legacy worker: read-only. Use the original Bash manager." if readonly else None
             )
         config = self.configs.get(self.selected)
+        add_button = self.query_one("#add-workers", Button)
+        add_button.disabled = config is None or config.provider in ("devin", "droid") or readonly
+        add_button.tooltip = (
+            f"{config.provider.capitalize()} uses one shared worker; "
+            "manage project directories with e."
+            if config is not None and config.provider in ("devin", "droid")
+            else None
+        )
         dirs_button = self.query_one("#dirs", Button)
-        dirs_button.disabled = config is None or config.provider != "amp" or readonly
+        dirs_button.disabled = (
+            config is None
+            or config.provider not in ("amp", "devin", "droid")
+            or (config.provider == "droid" and bool(config.repo_url))
+            or readonly
+        )
         dirs_button.tooltip = (
-            "Amp only: serve extra directories or discover Git checkouts."
+            "Manage existing Devin/Droid project directories or Amp runner directories."
             if dirs_button.disabled
             else None
         )
@@ -816,22 +869,31 @@ class FleetApp(App):
             )
         else:
             config = self.configs.get(self.selected)
-            self.query_one("#context", Static).update(
-                f"{config.runner_id} · "
-                + (
-                    "One shared process; a row action affects the whole runner."
-                    + (
-                        f" {len(config.extra_dirs)} extra directories, "
-                        f"{len(config.discover_dirs)} discovery roots."
-                        if config.provider == "amp"
-                        else ""
-                    )
-                    if config.shared
-                    else "Independent worker processes."
+            if config is None:
+                context = (
+                    "Your fleet is empty. Press n to create your first instance. Press ? for help."
                 )
-                if config is not None
-                else "Your fleet is empty. Press n to create your first instance. Press ? for help."
-            )
+            elif config.provider == "devin":
+                context = (
+                    f"{config.runner_id} · One shared Devin queue worker; "
+                    f"{len(config.project_dirs)} linked project directories."
+                )
+            elif config.provider == "amp":
+                context = (
+                    f"{config.runner_id} · One shared runner; {len(config.extra_dirs)} extra "
+                    f"directories, {len(config.discover_dirs)} discovery roots."
+                )
+            elif config.provider == "droid":
+                identity = self.manager.droid_identity(config)
+                context = (
+                    f"{identity} · One shared Droid computer; "
+                    f"{len(config.project_dirs)} linked project directories."
+                    if config.project_dirs
+                    else f"{identity} · One shared Droid computer."
+                )
+            else:
+                context = f"{config.runner_id} · Independent worker processes."
+            self.query_one("#context", Static).update(context)
 
     def visible_rows(self) -> list[WorkerStatus]:
         return [row for row in self.rows if row.instance == self.selected]
@@ -896,8 +958,14 @@ class FleetApp(App):
         summary_lines = [
             f"Provider: {payload['provider'].capitalize()}",
             f"Instance: {payload['name']}",
-            f"Workspace source: {payload['source']}",
-            f"Workers / checkouts: {payload['count']}",
+            *(
+                [f"Project directories: {', '.join(payload['project_dirs'])}"]
+                if payload.get("project_dirs")
+                else [
+                    f"Workspace source: {payload['source']}",
+                    f"Workers / checkouts: {payload['count']}",
+                ]
+            ),
             f"Runner label: {payload.get('label') or 'Default for this host'}",
             f"Backend preference: {backend_names[payload['backend']]}",
             f"GPU split: {'enabled' if payload.get('gpu_split') else 'off'}",
@@ -987,6 +1055,13 @@ class FleetApp(App):
         if self.selected is None:
             self.notify("Select an instance first.")
             return
+        config = self.configs.get(self.selected)
+        if config is not None and config.provider == "devin":
+            self.notify("Devin uses one queue worker; add projects with e.", severity="warning")
+            return
+        if config is not None and config.provider == "droid":
+            self.notify("Droid uses one shared computer; add projects with e.", severity="warning")
+            return
         name = self.selected
         preview = self.manager.dry_run
         self.push_screen(
@@ -1004,8 +1079,11 @@ class FleetApp(App):
         if config is None:
             self.notify("Select an instance first.")
             return
-        if config.provider != "amp":
-            self.notify("Only Amp instances manage extra directories.", severity="warning")
+        if config.provider not in ("amp", "devin", "droid"):
+            self.notify(
+                "Only Devin, Amp and Droid instances manage multiple directories.",
+                severity="warning",
+            )
             return
 
         def done(request) -> None:

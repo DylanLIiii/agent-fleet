@@ -61,25 +61,61 @@ def supervise(home: Path, name: str, index: int) -> int:
         )
         if stopping:
             return 0
-        child = subprocess.Popen(
-            command.argv,
-            cwd=command.cwd,
-            env={**os.environ, **command.env},
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            errors="replace",
-            start_new_session=True,
-        )
-        if stopping:
-            stop(signal.SIGTERM, None)
-        if child.stdout is not None:
-            for line in child.stdout:
-                logger.info(
-                    "%s", line.rstrip().replace(secret, "[REDACTED]") if secret else line.rstrip()
+        for attempt in range(2 if config.provider == "droid" else 1):
+            child = subprocess.Popen(
+                command.argv,
+                cwd=command.cwd,
+                env={**os.environ, **command.env},
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                errors="replace",
+                start_new_session=True,
+            )
+            if stopping:
+                stop(signal.SIGTERM, None)
+            needs_register = False
+            if child.stdout is not None:
+                for line in child.stdout:
+                    cleaned = (
+                        line.rstrip().replace(secret, "[REDACTED]") if secret else line.rstrip()
+                    )
+                    logger.info("%s", cleaned)
+                    if "requires a registered computer" in cleaned or (
+                        "droid computer register" in cleaned
+                    ):
+                        needs_register = True
+            code = child.wait()
+            if (
+                config.provider == "droid"
+                and attempt == 0
+                and code != 0
+                and needs_register
+                and not stopping
+            ):
+                logger.info("Computer is not registered yet; running droid computer register -y…")
+                reg = subprocess.run(
+                    [command.argv[0], "computer", "register", "-y"],
+                    cwd=command.cwd,
+                    env={**os.environ, **command.env},
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=False,
                 )
-        code = child.wait()
+                for reg_line in (reg.stdout + "\n" + reg.stderr).splitlines():
+                    if reg_line.strip():
+                        logger.info("%s", reg_line.strip())
+                if reg.returncode == 0 and not stopping:
+                    logger.info(
+                        "Starting %s. Remote task availability must be confirmed on-platform.",
+                        config.key(index),
+                    )
+                    continue
+                code = reg.returncode or code
+            break
         logger.info("Worker exited (code %s).", code)
         return 0 if stopping else code
     except (FleetError, OSError):

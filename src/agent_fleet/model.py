@@ -103,6 +103,8 @@ class Instance:
     outpost_name: str = ""
     gpu_split: bool = False
     use_systemd: bool = False
+    # Devin and Droid: existing local projects linked into the shared worker workspace.
+    project_dirs: tuple[str, ...] = ()
     # Amp only: directories served besides the managed checkouts, and Amp-side discovery.
     extra_dirs: tuple[str, ...] = ()
     discover_dirs: tuple[str, ...] = ()
@@ -131,6 +133,29 @@ class Instance:
         for value in (self.repo_url, self.droid_dir, self.outpost_name):
             if not isinstance(value, str) or any(ord(c) < 32 for c in value):
                 raise FleetError("Configuration fields cannot contain control characters.")
+        if self.provider in ("devin", "droid"):
+            check_paths("Project directories", self.project_dirs)
+            names = [Path(path).name.casefold() for path in self.project_dirs]
+            if len(set(names)) != len(names):
+                raise FleetError("Project directory names must be unique.")
+            if self.project_dirs and self.repo_url:
+                raise FleetError(
+                    f"{self.provider.capitalize()} uses existing project directories, "
+                    "not a single Git source."
+                )
+            if self.project_dirs and self.gpu_split:
+                raise FleetError(
+                    f"GPU splitting is not supported for the shared "
+                    f"{self.provider.capitalize()} worker."
+                )
+            if self.project_dirs and (self.worker_count != 1 or self.active_workers != (1,)):
+                raise FleetError(
+                    f"A multi-project {self.provider.capitalize()} instance uses one shared worker."
+                )
+            if self.provider == "devin" and not self.repo_url and not self.project_dirs:
+                raise FleetError("Devin requires at least one existing project directory.")
+        elif self.project_dirs:
+            raise FleetError("Only Devin and Droid instances can link project directories.")
         if self.provider == "amp":
             check_paths("Extra directories", self.extra_dirs)
             check_paths("Discovery roots", self.discover_dirs)
@@ -144,9 +169,9 @@ class Instance:
         if self.provider == "droid":
             if self.worker_count != 1 or not Path(self.droid_dir).is_absolute():
                 raise FleetError("Droid requires one worker and an absolute local directory.")
-            if not Path(self.droid_dir).is_dir() and not self.repo_url:
+            if not Path(self.droid_dir).is_dir() and not self.repo_url and not self.project_dirs:
                 raise FleetError("The Droid working directory does not exist.")
-        elif not self.repo_url or self.repo_url.startswith("-"):
+        elif self.provider != "devin" and (not self.repo_url or self.repo_url.startswith("-")):
             raise FleetError("Enter a Git URL or an existing local repository.")
         if self.repo_url and "://" in self.repo_url:
             parsed = urlsplit(self.repo_url)
@@ -167,7 +192,9 @@ class Instance:
 
     @property
     def shared(self) -> bool:
-        return self.provider in ("amp", "droid")
+        return self.provider in ("amp", "droid") or (
+            self.provider == "devin" and bool(self.project_dirs)
+        )
 
     def targets(self, target: str = "all") -> tuple[int, ...]:
         if target == "all" or (self.shared and target == self.runner_id):

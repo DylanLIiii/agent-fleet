@@ -100,7 +100,10 @@ async def test_setup_preview_review_and_no_writes(store, source):
         assert not app.busy
 
 
-async def test_setup_review_includes_provider_specific_settings(store):
+async def test_setup_review_includes_devin_project_settings(store, tmp_path):
+    projects = [tmp_path / "Jev-seen", tmp_path / "MiniCPM-V", tmp_path / "Vvbot"]
+    for project in projects:
+        project.mkdir()
     app = FleetApp(Manager(store))
     async with app.run_test(size=(100, 36)) as pilot:
         await pilot.pause()
@@ -111,11 +114,13 @@ async def test_setup_review_includes_provider_specific_settings(store):
         await pilot.pause()
         screen.query_one("#instance-name", Input).value = "devin-preview"
         screen.query_one("#runner-label", Input).value = "team-runner"
-        screen.query_one("#source", Input).value = "https://example.com/project.git"
         screen.query_one("#outpost", Input).value = "build-room"
+        screen.query_one("#project-dirs", Input).value = ", ".join(map(str, projects))
         screen.query_one("#secret", Input).value = "must-not-appear-in-review"
         screen.query_one("#backend", Select).value = "process"
-        screen.query_one("#gpu-split", Checkbox).value = True
+        assert screen.query_one("#worker-count", Input).value == "1"
+        assert screen.query_one("#worker-count", Input).disabled
+        assert screen.query_one("#gpu-split", Checkbox).disabled
 
         await pilot.click("#setup-submit")
         await pilot.pause()
@@ -124,9 +129,46 @@ async def test_setup_review_includes_provider_specific_settings(store):
         summary = str(app.screen.query_one("#confirm-message", Static).render())
         assert "Runner label: team-runner" in summary
         assert "Outpost: build-room" in summary
+        assert f"Project directories: {', '.join(map(str, projects))}" in summary
         assert "Backend preference: Detached process" in summary
-        assert "GPU split: enabled" in summary
+        assert "GPU split: off" in summary
+        assert "Workspace source" not in summary
         assert "must-not-appear-in-review" not in summary
+
+
+async def test_devin_directory_management_links_existing_projects(manager, tmp_path):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    from agent_fleet.manager import make_instance
+
+    config = make_instance(
+        manager.store,
+        name="devin-dirs",
+        provider="devin",
+        outpost="shared-outpost",
+        project_dirs=[str(first)],
+        backend="process",
+    )
+    manager.setup(config)
+    app = FleetApp(manager)
+    async with app.run_test(size=(110, 38)) as pilot:
+        await pilot.pause()
+        assert app.selected == "devin-dirs"
+        assert not app.query_one("#dirs", Button).disabled
+        assert app.query_one("#add-workers", Button).disabled
+        assert await pilot.click("#dirs")
+        await pilot.pause()
+        assert "project directories" in str(app.screen.query_one(".dialog-title").render())
+        app.screen.query_one("#dir-path", Input).value = str(second)
+        assert await pilot.click("#dir-add")
+        await pilot.pause(0.5)
+        assert manager.store.load(config.name).project_dirs == (
+            str(first.resolve()),
+            str(second.resolve()),
+        )
+        assert len(app.screen_stack) == 1
 
 
 async def test_amp_setup_review_includes_discovery_options(store, tmp_path):

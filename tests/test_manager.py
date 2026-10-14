@@ -141,7 +141,8 @@ def test_provider_commands_and_empty_gpu(config, tmp_path):
         executable="/bin/devin",
         secret="synthetic-test-secret",
     )
-    assert "--token=synthetic-test-secret" in devin.argv
+    assert "--token=synthetic-test-secret" not in devin.argv
+    assert devin.env["DEVIN_OUTPOSTS_TOKEN"] == "synthetic-test-secret"
     assert "synthetic-test-secret" not in repr(devin)
     assert devin.env["DEVIN_WORKDIR"] == str(tmp_path / "devin-workers/w1")
 
@@ -221,6 +222,129 @@ def test_make_instance_from_local_remote(store, source):
     assert config.repo_name == "project"
 
 
+def test_devin_uses_one_worker_for_existing_project_directories(manager, tmp_path):
+    projects = [tmp_path / "Jev-seen", tmp_path / "MiniCPM-V", tmp_path / "Vvbot"]
+    for project in projects:
+        project.mkdir()
+        (project / "keep.txt").write_text(project.name)
+
+    config = make_instance(
+        manager.store,
+        name="devin-lab",
+        provider="devin",
+        outpost="shared-outpost",
+        project_dirs=[str(path) for path in projects],
+        backend="process",
+    )
+
+    assert config.repo_url == ""
+    assert config.worker_count == 1
+    assert config.active_workers == (1,)
+    assert config.shared
+    command = build_command(
+        config,
+        manager.store.location(config.name),
+        1,
+        executable="/bin/devin",
+    )
+    assert command.argv == [
+        "/bin/devin",
+        "worker",
+        "start",
+        "--outpost=shared-outpost",
+    ]
+    assert "DEVIN_OUTPOSTS_TOKEN" not in command.env
+    assert command.env["DEVIN_WORKDIR"] == str(
+        manager.store.location(config.name) / "devin-workers/w1"
+    )
+    messages = manager.setup(config)
+    worker = config.worker_dir(manager.store.location(config.name), 1)
+    assert len([message for message in messages if message.startswith("Link existing")]) == 3
+    assert all((worker / "projects" / path.name).is_symlink() for path in projects)
+    assert all((worker / "projects" / path.name).resolve() == path.resolve() for path in projects)
+    assert not (worker / "repos").exists()
+    assert manager.store.load(config.name) == config
+    assert len(manager.list_dirs(config.name)) == 3
+
+    manager.remove(config.name)
+    assert not manager.store.location(config.name).joinpath("fleet.json").exists()
+    assert not (worker / "projects" / projects[0].name).exists()
+    assert all((path / "keep.txt").read_text() == path.name for path in projects)
+
+
+def test_devin_add_remove_projects_without_touching_sources(manager, tmp_path):
+    projects = [tmp_path / "first", tmp_path / "second", tmp_path / "third"]
+    for project in projects:
+        project.mkdir()
+    config = make_instance(
+        manager.store,
+        name="devin-dirs",
+        provider="devin",
+        outpost="shared-outpost",
+        project_dirs=[str(projects[0]), str(projects[1])],
+        backend="process",
+    )
+    manager.setup(config)
+
+    manager.add_dirs(config.name, [str(projects[2])])
+    saved = manager.store.load(config.name)
+    assert saved.project_dirs == tuple(str(path) for path in projects)
+
+    manager.remove_dirs(config.name, [str(projects[1])])
+    saved = manager.store.load(config.name)
+    assert saved.project_dirs == (str(projects[0]), str(projects[2]))
+    worker = config.worker_dir(manager.store.location(config.name), 1)
+    assert not (worker / "projects" / "second").exists()
+    assert projects[1].is_dir()
+
+    with pytest.raises(FleetError, match="at least one project"):
+        manager.remove_dirs(config.name, [str(projects[0]), str(projects[2])])
+    assert manager.store.load(config.name).project_dirs == saved.project_dirs
+    assert (worker / "projects" / "first").is_symlink()
+
+    with pytest.raises(FleetError, match="uses one queue worker"):
+        manager.add(config.name)
+
+
+def test_devin_project_names_must_be_unique(manager, tmp_path):
+    first = tmp_path / "one" / "project"
+    second = tmp_path / "two" / "project"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    with pytest.raises(FleetError, match="names must be unique"):
+        make_instance(
+            manager.store,
+            name="devin-collision",
+            provider="devin",
+            outpost="shared-outpost",
+            project_dirs=[str(first), str(second)],
+            backend="process",
+        )
+
+
+def test_devin_does_not_share_a_directory_with_an_active_fleet_worker(manager, config, monkeypatch):
+    manager.setup(config)
+    active_checkout = config.repo_dir(manager.store.location(config.name), 1)
+    devin = make_instance(
+        manager.store,
+        name="devin-overlap",
+        provider="devin",
+        outpost="shared-outpost",
+        project_dirs=[str(active_checkout)],
+        backend="process",
+    )
+    monkeypatch.setattr(
+        manager,
+        "running",
+        lambda other, _index: other.name == config.name,
+    )
+
+    with pytest.raises(FleetError, match="overlaps active instance"):
+        manager.setup(devin)
+
+    assert not manager.store.location(devin.name).exists()
+
+
 def test_start_failure_stops_supervisor_and_child(manager, config, fake_amp, monkeypatch):
     manager.setup(config)
     manager.ready_timeout = 0.5
@@ -240,8 +364,8 @@ def test_supervisor_redacts_credential(manager, config, tmp_path, monkeypatch):
     executable = directory / "devin"
     executable.write_text(
         f"#!{sys.executable}\n"
-        "import sys, time\n"
-        "print(next(a for a in sys.argv if a.startswith('--token=')), flush=True)\n"
+        "import os, time\n"
+        "print(os.environ.get('DEVIN_OUTPOSTS_TOKEN'), flush=True)\n"
         "while True: time.sleep(0.1)\n"
     )
     executable.chmod(0o700)
@@ -488,9 +612,9 @@ def test_amp_discovery_configuration(manager, config, tmp_path):
 def test_directory_management_is_amp_only(manager, config, source, tmp_path):
     cursor = replace(config, provider="cursor", name="cursor-lab")
     manager.setup(cursor)
-    with pytest.raises(FleetError, match="Only Amp"):
+    with pytest.raises(FleetError, match="Only Devin, Amp and Droid"):
         manager.add_dirs("cursor-lab", [str(tmp_path)])
-    with pytest.raises(FleetError, match="Only Amp"):
+    with pytest.raises(FleetError, match="Only Devin, Amp and Droid"):
         manager.list_dirs("cursor-lab")
 
 

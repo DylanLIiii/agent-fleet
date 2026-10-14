@@ -51,9 +51,9 @@ Setup can prepare configuration and workspaces before a provider CLI is installe
 | Provider | Process model | Readiness evidence |
 | --- | --- | --- |
 | Cursor | One worker per independent checkout, data directory and management port | Local `/readyz` |
-| Devin | One Outpost worker per workspace; repository under `repos/` | Process alive; remote readiness unverified |
+| Devin | One Outpost queue worker per instance; existing project directories linked under `projects/` | Process alive; remote readiness unverified |
 | Amp | **One runner** serving its checkouts, your own directories and Amp-discovered checkouts | Matching runner in `amp runner list --json` |
-| Droid | **One Computer per Fleet home**, using a local directory or a managed Git clone | Local `daemon.loopback` diagnostic |
+| Droid | **One Computer per Fleet home**, using a local directory, linked project directories or a managed Git clone | Daemon running + `daemon.loopback` diagnostic |
 
 Only one Droid registration is supported by the provider per machine. Do not create
 another using a different Fleet home or outside this application.
@@ -68,7 +68,7 @@ tasks. Confirm dispatch on the provider platform.
 | `s` / `x` | Start / stop selected worker |
 | `ctrl+r` | Restart selected worker |
 | `a` | Add workers to selected instance |
-| `e` | Manage Amp directories |
+| `e` | Manage Devin projects or Amp directories |
 | `delete` | Remove selected worker |
 | `r` | Refresh process status and readiness |
 | `l` / `d` | Logs / health |
@@ -77,7 +77,7 @@ tasks. Confirm dispatch on the provider platform.
 | `ctrl+p` | Command palette |
 | `q` | Quit |
 
-Amp and Droid row actions affect the shared runner, not just one directory.
+Devin, Amp and Droid row actions affect the shared process, not just one directory.
 
 ## Scriptable, too
 
@@ -115,9 +115,29 @@ agent-fleet --instance amp-lab dirs discover --clear
 ```
 
 Use `--backend process` or `--backend systemd` at setup to override auto-detection.
-For Devin, add `--outpost NAME`; the token is requested using a masked prompt.
-For Droid, use `--source /absolute/local/path` to reuse a directory, or a Git URL
-to clone it automatically. The worker count is always one:
+Devin uses one worker and one Outpost for all configured projects. Add one
+`--project-dir` for each existing local checkout; the optional Outpost token is
+requested using a masked prompt, or leave it blank to use Devin CLI login:
+
+```console
+agent-fleet setup --provider devin --name devin-lab --outpost shared-outpost \
+  --project-dir /home/you/Jev-seen \
+  --project-dir /home/you/MiniCPM-V \
+  --project-dir /home/you/Vvbot
+agent-fleet --instance devin-lab dirs
+agent-fleet --instance devin-lab start
+```
+
+Agent Fleet places symlinks to these directories under
+`~/.agent-fleet/instances/<name>/devin-workers/w1/projects/`. Source folders are
+never cloned, overwritten or deleted. Stop the worker before adding or removing
+project links; removing the whole instance also removes only those managed links.
+Devin sessions still check out their assigned repository under the worker's
+`repos/` directory. The linked `projects/` directories let the worker reach the
+other local checkouts from the same workspace.
+For Droid, use `--source /absolute/local/path` to reuse a directory, `--project-dir`
+to link multiple existing project directories under `droid-workers/w1/projects/`, or a
+Git URL to clone it automatically. The worker count is always one:
 
 ```console
 agent-fleet setup --provider droid --name droid-project \
@@ -133,12 +153,14 @@ Droid workspaces are kept on removal, whether reused or cloned.
 ![Droid Git URL setup review](assets/droid-setup.png)
 
 Pass an existing local Git directory as `--source` to derive its origin and prepare
-independent Cursor/Devin/Amp clones. Existing source directories are never overwritten.
+independent Cursor/Amp clones. Existing source directories are never overwritten.
+For Devin, use `--project-dir` instead; it does not use Fleet-managed single-repository
+clones.
 
-`--gpu-split` sets `CUDA_VISIBLE_DEVICES` for independent Cursor/Devin workers,
-including an empty value for workers without an assigned GPU. Amp's single process
-cannot isolate GPUs per checkout; all its directories share one GPU environment.
-Stop all workers before scaling an instance with GPU allocation enabled.
+`--gpu-split` sets `CUDA_VISIBLE_DEVICES` for independent Cursor workers,
+including an empty value for workers without an assigned GPU. Devin uses one queue
+worker and Amp uses one runner, so neither splits GPUs by checkout. Stop all Cursor
+workers before scaling an instance with GPU allocation enabled.
 
 ## Amp directories
 
@@ -160,6 +182,17 @@ whenever it starts one, so directories added outside Fleet are dropped at the
 next start. Add them with `agent-fleet dirs add` to keep them. Worker checkouts
 still change only while the runner is stopped.
 
+## Devin projects
+
+A Devin instance is one queue-polling worker attached to one existing Outpost.
+It can manage several existing local project directories without creating one
+Fleet instance per repository. Add or list them with `agent-fleet dirs add PATH`,
+`agent-fleet dirs`, and `agent-fleet dirs remove PATH`; these operations link or
+unlink the source directories under the worker's `projects/` folder. Devin Cloud
+still chooses a session repository and checks it out under `repos/`; the additional
+local projects are reachable from the worker workspace but are not separate Cloud
+repository registrations.
+
 ## State and safety
 
 The default Fleet home is `~/.agent-fleet`. Override it with `FLEET_HOME` or `--home`.
@@ -173,7 +206,7 @@ It must be an absolute, non-root path with no symlink components.
     cursor-api-key         # optional private credential
     devin-token            # private credential
     checkouts/             # Cursor / Amp / Git-source Droid clones
-    devin-workers/         # Devin workers, each containing repos/
+    devin-workers/         # Devin workers, each containing repos/ and linked projects/
     data/                  # isolated Cursor data directories
     run/                   # PID + Linux process birth-time identity
     logs/                  # rotating private logs, 10 MiB × 4 files per process
@@ -184,8 +217,9 @@ It must be an absolute, non-root path with no symlink components.
 - Systemd units contain only the Python supervisor command, never stored credentials.
 - Detached workers use a Python supervisor with signal forwarding and rotating logs.
   The dashboard does not need to stay open.
-- Provider-required token arguments may still be visible in the provider process's
-  command line to other processes with sufficient permissions. Use a trusted host.
+- Devin Outpost tokens are passed to the CLI through its documented environment
+  variable, not a command-line argument. They remain available to the worker process;
+  use a trusted host.
 - `remove` keeps checkouts by default. `--delete-checkouts` additionally requires a
   matching ownership marker and origin, no modified/untracked/ignored files, and no
   unpushed branch commits. Droid's existing directory is **never** deleted.

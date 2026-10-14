@@ -279,7 +279,7 @@ Input:focus {
 #capacity-row > Vertical {
     width: 1fr;
 }
-#dirs-fields, #discover-row {
+#dirs-fields, #project-fields, #discover-row {
     height: auto;
 }
 #discover-row {

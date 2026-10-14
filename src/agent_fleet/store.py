@@ -68,6 +68,7 @@ def parse_legacy(text: str) -> dict[str, str]:
         "GPU_SPLIT",
         "OUTPOST_NAME",
         "USE_SYSTEMD",
+        "PROJECT_DIRS",
         "EXTRA_DIRS",
         "DISCOVER_DIRS",
         "DISCOVER_DEPTH",
@@ -181,7 +182,14 @@ class Store:
         try:
             if native.exists() or native.is_symlink():
                 data = json.loads(private_read(native))
-                for key in ("active_workers", "extra_dirs", "discover_dirs", "discover_excludes"):
+                data.setdefault("project_dirs", ())
+                for key in (
+                    "active_workers",
+                    "project_dirs",
+                    "extra_dirs",
+                    "discover_dirs",
+                    "discover_excludes",
+                ):
                     if key in data:
                         data[key] = tuple(data[key])
                 config = Instance(**data)
@@ -216,6 +224,7 @@ class Store:
                     outpost_name=data.get("OUTPOST_NAME", ""),
                     gpu_split=data["GPU_SPLIT"] == "yes",
                     use_systemd=data["USE_SYSTEMD"] == "yes",
+                    project_dirs=legacy_list(data, "PROJECT_DIRS"),
                     extra_dirs=legacy_list(data, "EXTRA_DIRS"),
                     discover_dirs=legacy_list(data, "DISCOVER_DIRS"),
                     discover_depth=int(data.get("DISCOVER_DEPTH") or 0),
@@ -260,6 +269,7 @@ class Store:
                 "GPU_SPLIT": "yes" if config.gpu_split else "no",
                 "OUTPOST_NAME": config.outpost_name,
                 "USE_SYSTEMD": "yes" if config.use_systemd else "no",
+                "PROJECT_DIRS": json.dumps(list(config.project_dirs)),
                 # Directory lists stay one quoted word: a JSON array survives the legacy parser.
                 "EXTRA_DIRS": json.dumps(list(config.extra_dirs)),
                 "DISCOVER_DIRS": json.dumps(list(config.discover_dirs)),
