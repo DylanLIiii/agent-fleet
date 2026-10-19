@@ -27,12 +27,14 @@ from agent_fleet.model import (
     under_root,
 )
 from agent_fleet.providers import (
+    DROID_LOGIN_HINT,
     amp_dirs_command,
     amp_served_dirs,
     binary,
     droid_cli_version,
-    droid_log_info,
+    droid_login_state,
     droid_registration,
+    droid_startup_error,
     gpu_count,
     readiness,
     run,
@@ -299,7 +301,18 @@ class Manager:
         def evidence(config: Instance, index: int) -> str:
             if not self.running(config, index):
                 return self._legacy_state(config, index) or "stopped"
-            return readiness(config, index, self.paths(config, index)[1]) if probe else "running"
+            if not probe:
+                return "running"
+            state = readiness(config, index, self.paths(config, index)[1])
+            # A daemon can outlive its Factory session and keep passing local diagnostics, and a
+            # crash-looping systemd unit never gets past "starting". Name the cause in both cases.
+            if (
+                config.provider == "droid"
+                and state in ("local ready", "starting")
+                and droid_login_state() == "login required"
+            ):
+                return "login required"
+            return state
 
         # Slow provider probes must not serialize hundreds of independent workers.
         with ThreadPoolExecutor(max_workers=8) as pool:
@@ -953,7 +966,7 @@ class Manager:
             time.sleep(min(0.3, self.ready_timeout))
             while time.monotonic() < deadline:
                 if not self.running(config, index):
-                    detail = droid_log_info(logfile)["error"] if config.provider == "droid" else ""
+                    detail = droid_startup_error(logfile) if config.provider == "droid" else ""
                     raise FleetError(
                         f"Worker exited during startup: {detail}"
                         if detail
@@ -961,7 +974,7 @@ class Manager:
                     )
                 evidence = readiness(config, index, logfile)
                 if not self.running(config, index):
-                    detail = droid_log_info(logfile)["error"] if config.provider == "droid" else ""
+                    detail = droid_startup_error(logfile) if config.provider == "droid" else ""
                     raise FleetError(
                         f"Worker exited during its readiness probe: {detail}"
                         if detail
@@ -981,7 +994,9 @@ class Manager:
                     )
                 time.sleep(0.3)
             raise FleetError(
-                "Readiness timed out. Check logs, authentication and provider connectivity."
+                DROID_LOGIN_HINT
+                if config.provider == "droid" and droid_login_state() == "login required"
+                else "Readiness timed out. Check logs, authentication and provider connectivity."
             )
         except FleetError:
             self._stop(config, index)
@@ -1181,10 +1196,12 @@ class Manager:
         checks.append(("pass" if shutil.which("git") else "fail", "Git", "Required for checkouts."))
         checks.append(("info", "NVIDIA GPUs", str(gpu_count())))
         for config in [self.store.load(name)] if name else self.store.all():
+            cli_found = True
             try:
                 binary(config.provider)
                 checks.append(("pass", config.name, "Provider CLI found."))
             except FleetError as exc:
+                cli_found = False
                 checks.append(("fail", config.name, str(exc)))
             for index in config.active_workers:
                 try:
@@ -1213,6 +1230,19 @@ class Manager:
                     )
                 )
             elif config.provider == "droid":
+                login = droid_login_state() if cli_found else ""
+                if login == "ok":
+                    checks.append(("pass", config.name, "Factory login is valid."))
+                elif login == "login required":
+                    checks.append(("fail", config.name, DROID_LOGIN_HINT))
+                elif login:
+                    checks.append(
+                        (
+                            "info",
+                            config.name,
+                            "Could not verify the Factory login. Run: droid doctor --checks auth",
+                        )
+                    )
                 reg = droid_registration(self.paths(config, 1)[1], probe_cli=True)
                 if reg:
                     target = (

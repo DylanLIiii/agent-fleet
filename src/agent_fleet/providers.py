@@ -25,8 +25,15 @@ GUIDANCE = {
     ),
 }
 
+DROID_LOGIN_HINT = (
+    "Factory login is missing or has expired. "
+    "Run `droid` and sign in (/login), then restart the worker."
+)
 
-def run(args: list[str], *, timeout: float = 10, cwd: Path | None = None) -> str:
+
+def run(
+    args: list[str], *, timeout: float = 10, cwd: Path | None = None, check: bool = True
+) -> str:
     try:
         result = subprocess.run(
             args,
@@ -41,7 +48,7 @@ def run(args: list[str], *, timeout: float = 10, cwd: Path | None = None) -> str
         raise FleetError(
             f"Could not run {Path(args[0]).name}. Check installation and connectivity."
         ) from exc
-    if result.returncode:
+    if result.returncode and check:
         # Child errors can include URL credentials or tokens. Never echo them.
         raise FleetError(f"{Path(args[0]).name} exited with code {result.returncode}.")
     return result.stdout.strip()
@@ -235,6 +242,36 @@ def droid_cli_version() -> str | None:
         return None
     first = output.splitlines()[0].strip() if output else ""
     return first.removeprefix("v") if first else None
+
+
+def droid_login_state() -> str:
+    """Return "ok", "login required", or "unknown" when Droid's auth check is unclear.
+
+    Doctor exits nonzero for unrelated failures such as being offline, so only its JSON counts.
+    The verdict has no machine-readable reason, so a signed-out CLI is recognized by its wording;
+    if that wording ever changes this degrades to "unknown" rather than blaming the login.
+    """
+    try:
+        output = run(
+            [binary("droid"), "doctor", "--checks", "auth", "--json", "--timeout", "3000"],
+            timeout=10,
+            check=False,
+        )
+        results = json.loads(output)["results"]
+        verdict = next((item for item in results if item.get("id") == "auth.verify"), {})
+    except (FleetError, ValueError, KeyError, TypeError, AttributeError):
+        return "unknown"
+    if verdict.get("status") == "pass":
+        return "ok"
+    return "login required" if "not logged in" in str(verdict.get("detail")) else "unknown"
+
+
+def droid_startup_error(logfile: Path | None) -> str:
+    """Why a Droid worker failed to start, naming a missing or expired Factory login."""
+    error = droid_log_info(logfile)["error"]
+    if droid_login_state() != "login required":
+        return error
+    return f"{DROID_LOGIN_HINT} ({error})" if error else DROID_LOGIN_HINT
 
 
 def amp_runner(config: Instance) -> dict | None:

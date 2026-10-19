@@ -69,6 +69,8 @@ discovers under the roots you choose.
 **Ready** means Cursor's local `/readyz` passed. **Local ready** means Amp's
 runner listing or Droid's local daemon diagnostic passed.
 **Unverified** means Devin is alive but has no worker-specific readiness probe.
+**Login required** means Droid is running but Factory reports no usable login; run `droid`
+and sign in (`/login`), then restart the worker.
 **Legacy running** means an older Cursor PID record matches a live worker, but
 the process is read-only. **Unverified PID** means a legacy record cannot prove
 the worker's identity. Use the original Bash manager for these workers.
@@ -758,7 +760,7 @@ class FleetApp(App):
                 self.call_after_refresh(self.action_refresh)
 
     def _preserve_cached_readiness(self, rows: list[WorkerStatus]) -> list[WorkerStatus]:
-        readiness_states = {"ready", "local ready", "unverified", "starting"}
+        readiness_states = {"ready", "local ready", "unverified", "starting", "login required"}
         previous = {(row.instance, row.index): row.state for row in self.rows}
         return [
             replace(row, state=previous[(row.instance, row.index)])
@@ -806,6 +808,7 @@ class FleetApp(App):
             "local ready": "#76ddab",
             "unverified": "#eccb7a",
             "starting": "#eccb7a",
+            "login required": "#f3aab1",
             "stopped": "#8c99ae",
             "running": "#a6c9ff",
             "legacy running": "#eccb7a",

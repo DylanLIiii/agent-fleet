@@ -2,10 +2,12 @@ from pathlib import Path
 
 import pytest
 from textual.widgets import Input, Select, Static
+from typer.testing import CliRunner
 
+from agent_fleet.cli import app as cli_app
 from agent_fleet.manager import Manager, make_instance
 from agent_fleet.model import FleetError
-from agent_fleet.providers import run
+from agent_fleet.providers import droid_login_state, run
 from agent_fleet.ui import ConfirmScreen, FleetApp, SetupScreen
 
 
@@ -18,6 +20,90 @@ def planned_droid(manager, source):
         count=4,
         backend="process",
     )
+
+
+def local_droid(manager, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir(exist_ok=True)
+    config = make_instance(
+        manager.store, name="droid-local", provider="droid", source=str(work), backend="process"
+    )
+    manager.setup(config)
+    return config
+
+
+def install_fake_droid(tmp_path, monkeypatch, *, login="ok", daemon="ready"):
+    """Put a fake `droid` on PATH. Rewrite tmp_path/droid-login to change the login mid-test."""
+    import json
+    import os
+    import sys
+
+    def auth(*results, code=0):
+        return json.dumps({"results": list(results)}), code
+
+    signed_in = {
+        "id": "auth.verify",
+        "status": "pass",
+        "detail": "authenticated as a***@example.com via stored login session",
+    }
+    signed_out = {
+        "id": "auth.verify",
+        "status": "warn",
+        "detail": "no usable credentials found (not logged in)",
+    }
+    offline = {"id": "auth.workosRefresh", "status": "fail", "detail": "ECONNREFUSED"}
+    rejected = {
+        "id": "auth.verify",
+        "status": "fail",
+        "detail": "FACTORY_API_KEY is set but the Factory API rejected it",
+    }
+    outputs = {
+        "ok": auth(signed_in),
+        "expired": auth(signed_out),
+        "expired-offline": auth(offline, signed_out, code=1),
+        "rejected": auth(rejected, code=1),
+        "no-verdict": auth({"id": "env.info", "status": "pass"}),
+        "garbage": ("not json", 0),
+        "old-cli": ("", 1),
+    }
+    login_file = tmp_path / "droid-login"
+    login_file.write_text(login)
+    binary_dir = tmp_path / "bin"
+    binary_dir.mkdir(exist_ok=True)
+    executable = binary_dir / "droid"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import json, pathlib, sys, time\n"
+        f"login = pathlib.Path({str(login_file)!r}).read_text().strip()\n"
+        f"outputs = {outputs!r}\n"
+        f"mode = {daemon!r}\n"
+        "args = sys.argv[1:]\n"
+        "if args[:1] == ['--version']:\n"
+        "    print('0.243.0')\n"
+        "elif args[:2] == ['computer', 'list']:\n"
+        "    print('agent-fleet\\tuuid-1234 (this machine)')\n"
+        "elif args[:1] == ['doctor'] and '--daemon' in args:\n"
+        "    print(json.dumps({'results': [{'id': 'daemon.loopback', 'status': 'pass'}]}))\n"
+        "elif args[:1] == ['doctor']:\n"
+        "    text, code = outputs[login]\n"
+        "    print(text)\n"
+        "    sys.exit(code)\n"
+        "elif mode == 'relay-error':\n"
+        "    print('Startup failed: Failed to resolve relay config for Remote Control',"
+        " flush=True)\n"
+        "    sys.exit(1)\n"
+        "else:\n"
+        "    if mode == 'ready':\n"
+        "        print('[droid daemon] Daemon is running', flush=True)\n"
+        "        print('  Version: 0.243.0', flush=True)\n"
+        "        print('  Relay: wss://relay.factory.ai/v0/computer/uuid-1234/agent "
+        "(Computer: agent-fleet, ID: uuid-1234)', flush=True)\n"
+        "    while True: time.sleep(0.1)\n"
+    )
+    executable.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{binary_dir}:{os.environ['PATH']}")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    return login_file
 
 
 def test_droid_git_url_clones_to_managed_workspace(manager, source):
@@ -308,6 +394,121 @@ def test_droid_doctor_reports_computer_and_version_drift(manager, source, tmp_pa
         details = "\n".join(detail for _, _, detail in checks)
         assert "Registered Factory Computer: agent-fleet (uuid-1234)" in details
         assert "Running daemon is v0.240.0 while installed Droid CLI is v0.241.1" in details
+    finally:
+        manager.control("stop", config.name)
+
+
+@pytest.mark.parametrize(
+    ("login", "expected"),
+    [
+        ("ok", "ok"),
+        ("expired", "login required"),
+        ("expired-offline", "login required"),
+        ("rejected", "unknown"),
+        ("no-verdict", "unknown"),
+        ("garbage", "unknown"),
+        ("old-cli", "unknown"),
+    ],
+)
+def test_droid_login_state_reads_the_auth_verdict(tmp_path, monkeypatch, login, expected):
+    install_fake_droid(tmp_path, monkeypatch, login=login)
+    assert droid_login_state() == expected
+
+
+def test_droid_login_state_is_unknown_without_the_cli(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", str(tmp_path))
+    assert droid_login_state() == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("login", "state", "text"),
+    [
+        ("ok", "pass", "Factory login is valid"),
+        ("expired", "fail", "sign in"),
+        ("rejected", "info", "droid doctor --checks auth"),
+    ],
+)
+def test_droid_doctor_reports_the_factory_login(manager, tmp_path, monkeypatch, login, state, text):
+    install_fake_droid(tmp_path, monkeypatch, login=login)
+    config = local_droid(manager, tmp_path)
+    checks = manager.doctor(config.name)
+    assert any(s == state and text in detail for s, _, detail in checks), checks
+    assert (login == "ok") == any("Factory login is valid" in detail for _, _, detail in checks)
+
+
+@pytest.mark.parametrize(("login", "exit_code"), [("ok", 0), ("expired", 1)])
+def test_cli_doctor_fails_when_the_factory_login_has_expired(
+    manager, tmp_path, monkeypatch, login, exit_code
+):
+    install_fake_droid(tmp_path, monkeypatch, login=login)
+    config = local_droid(manager, tmp_path)
+    result = CliRunner().invoke(
+        cli_app, ["--home", str(manager.store.home), "--instance", config.name, "doctor"]
+    )
+    assert result.exit_code == exit_code, result.output
+    assert ("Factory login is missing" in result.output) == (login == "expired")
+
+
+def test_droid_doctor_skips_the_login_check_without_the_cli(manager, tmp_path, monkeypatch):
+    config = local_droid(manager, tmp_path)
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    checks = manager.doctor(config.name)
+    assert any(s == "fail" and "Install Droid CLI" in detail for s, _, detail in checks)
+    assert not any("Factory login" in detail for _, _, detail in checks)
+
+
+def test_droid_start_failure_names_an_expired_login(manager, tmp_path, monkeypatch):
+    install_fake_droid(tmp_path, monkeypatch, login="expired", daemon="relay-error")
+    monkeypatch.setattr("agent_fleet.manager.readiness", lambda *_: "starting")
+    config = local_droid(manager, tmp_path)
+    with pytest.raises(FleetError, match="sign in") as caught:
+        manager.control("start", config.name)
+    assert "Failed to resolve relay config" in str(caught.value)
+    assert not manager.running(config, 1)
+    assert "Factory login is missing or has expired" in manager.logs(config.name)
+
+
+def test_droid_start_failure_keeps_its_own_error_when_login_is_fine(manager, tmp_path, monkeypatch):
+    install_fake_droid(tmp_path, monkeypatch, login="ok", daemon="relay-error")
+    monkeypatch.setattr("agent_fleet.manager.readiness", lambda *_: "starting")
+    config = local_droid(manager, tmp_path)
+    with pytest.raises(FleetError, match="Failed to resolve relay config") as caught:
+        manager.control("start", config.name)
+    assert "login" not in str(caught.value).lower()
+    assert "Factory login" not in manager.logs(config.name)
+
+
+def test_droid_readiness_timeout_names_an_expired_login(manager, tmp_path, monkeypatch):
+    install_fake_droid(tmp_path, monkeypatch, login="expired", daemon="silent")
+    monkeypatch.setattr("agent_fleet.manager.readiness", lambda *_: "starting")
+    manager.ready_timeout = 1
+    config = local_droid(manager, tmp_path)
+    with pytest.raises(FleetError, match="sign in"):
+        manager.control("start", config.name)
+    assert not manager.running(config, 1)
+
+
+def test_droid_status_flags_a_live_daemon_whose_login_expired(manager, tmp_path, monkeypatch):
+    login = install_fake_droid(tmp_path, monkeypatch, login="ok", daemon="ready")
+    config = local_droid(manager, tmp_path)
+    try:
+        manager.control("start", config.name)
+        assert manager.status(config.name)[0].state == "local ready"
+
+        login.write_text("expired")
+        assert manager.status(config.name)[0].state == "login required"
+        assert manager.status(config.name, probe=False)[0].state == "running"
+
+        login.write_text("ok")
+        assert manager.status(config.name)[0].state == "local ready"
+
+        monkeypatch.setattr("agent_fleet.manager.readiness", lambda *_: "starting")
+        assert manager.status(config.name)[0].state == "starting"
+        login.write_text("expired")
+        assert manager.status(config.name)[0].state == "login required"
+        login.write_text("rejected")
+        assert manager.status(config.name)[0].state == "starting"
     finally:
         manager.control("stop", config.name)
 
