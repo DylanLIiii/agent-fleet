@@ -12,7 +12,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from agent_fleet.model import FleetError
-from agent_fleet.providers import build_command, gpu_count
+from agent_fleet.providers import DROID_LOGIN_HINT, build_command, droid_login_state, gpu_count
 from agent_fleet.store import Store, safe_path
 
 
@@ -116,6 +116,13 @@ def supervise(home: Path, name: str, index: int) -> int:
                     continue
                 code = reg.returncode or code
             break
+        if (
+            config.provider == "droid"
+            and code
+            and not stopping
+            and droid_login_state() == "login required"
+        ):
+            logger.info("%s", DROID_LOGIN_HINT)
         logger.info("Worker exited (code %s).", code)
         return 0 if stopping else code
     except (FleetError, OSError):

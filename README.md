@@ -53,7 +53,7 @@ Setup can prepare configuration and workspaces before a provider CLI is installe
 | Cursor | One worker per independent checkout, data directory and management port | Local `/readyz` |
 | Devin | One Outpost queue worker per instance; existing project directories linked under `projects/` | Process alive; remote readiness unverified |
 | Amp | **One runner** serving its checkouts, your own directories and Amp-discovered checkouts | Matching runner in `amp runner list --json` |
-| Droid | **One Computer per Fleet home**, using a local directory, linked project directories or a managed Git clone | Daemon running + `daemon.loopback` diagnostic |
+| Droid | **One Computer per Fleet home**, using a local directory, linked project directories or a managed Git clone | Daemon running + `daemon.loopback` diagnostic; **login required** when Factory reports no usable login |
 
 Only one Droid registration is supported by the provider per machine. Do not create
 another using a different Fleet home or outside this application.
@@ -149,6 +149,11 @@ Droid Git sources are cloned into
 The setup review shows this path. Clone failure leaves the instance unconfigured;
 no existing directory is overwritten and nothing starts automatically.
 Droid workspaces are kept on removal, whether reused or cloned.
+
+Droid Remote Control needs a valid Factory login, which can expire. When
+`droid doctor --checks auth` reports no usable login, `agent-fleet doctor` fails, a running
+worker shows **login required**, and a failed start says so instead of only reporting
+`Failed to resolve relay config`. Run `droid`, sign in with `/login`, then restart the worker.
 
 ![Droid Git URL setup review](assets/droid-setup.png)
 

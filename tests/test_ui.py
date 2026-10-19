@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 from threading import Event
 
 import pytest
@@ -368,6 +369,28 @@ async def test_auto_refresh_skips_readiness_probes_but_manual_refresh_runs_them(
         await pilot.press("r")
         await pilot.pause()
         assert probes and any(probe for probe in probes)
+
+
+async def test_login_required_survives_automatic_refresh(manager, config, monkeypatch):
+    manager.setup(config)
+    original_status = manager.status
+
+    def fake_status(name=None, *, probe=True):
+        state = "login required" if probe else "running"
+        return [replace(row, state=state) for row in original_status(name, probe=False)]
+
+    monkeypatch.setattr(manager, "status", fake_status)
+    app = FleetApp(manager)
+    async with app.run_test(size=(100, 36)) as pilot:
+        await pilot.pause()
+        await pilot.press("r")
+        await pilot.pause()
+        table = app.query_one("#workers", DataTable)
+        assert str(table.get_row_at(0)[2]) == "login required"
+
+        app._refresh_timer()
+        await pilot.pause()
+        assert str(table.get_row_at(0)[2]) == "login required"
 
 
 async def test_manual_refresh_is_queued_during_an_in_flight_refresh(manager, config, monkeypatch):
